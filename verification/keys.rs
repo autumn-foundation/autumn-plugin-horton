@@ -3,9 +3,10 @@ use vstd::prelude::*;
 verus! {
 
 // Model of `src/keys.rs`. App keys and plugin keys share one horton
-// keyspace. The proofs show the two sets are disjoint and that every
-// plugin key sorts before every app key, so an app scan that starts at
-// `[0x01]` never sees a plugin key (R6).
+// keyspace. The proofs show that the two sets are disjoint. They also show
+// that every plugin key sorts before every app key. An app scan starts at
+// `[0x01]` or later, so it never sees a plugin key (R6). Session, index
+// and clock keys all start with `0x00`, so `session_key` covers them.
 
 pub const KEY_MAX: usize = 128;
 pub const RESERVED: u8 = 0;
@@ -53,6 +54,8 @@ pub fn check_app_key(key: &[u8]) -> (r: KeyCheck)
     ensures
         (r is Accepted) <==> is_app_key(key@),
         (r is Empty) <==> key@.len() == 0,
+        (r is TooLarge) <==> key@.len() > KEY_MAX,
+        (r is Reserved) <==> (0 < key@.len() <= KEY_MAX && key@[0] == RESERVED),
 {
     if key.len() == 0 {
         KeyCheck::Empty
@@ -69,6 +72,8 @@ pub fn check_app_key(key: &[u8]) -> (r: KeyCheck)
 pub proof fn session_keys_are_plugin_keys(prefix: Seq<u8>, id: Seq<u8>)
     ensures is_plugin_key(session_key(prefix, id)),
 {
+    assert(seq![RESERVED][0] == RESERVED);
+    assert((seq![RESERVED] + prefix)[0] == RESERVED);
     assert(session_key(prefix, id)[0] == RESERVED);
 }
 
@@ -101,6 +106,28 @@ pub proof fn the_floor_sorts_at_or_below_app_keys(k: Seq<u8>)
         assert(!lex_lt(k.drop_first(), floor.drop_first()));
         assert(!lex_lt(k, floor));
     }
+}
+
+/// Every plugin key sorts before every app key.
+pub proof fn plugin_keys_sort_below_app_keys(p: Seq<u8>, k: Seq<u8>)
+    requires is_plugin_key(p), is_app_key(k),
+    ensures lex_lt(p, k),
+{}
+
+/// `app_floor`'s test: the bound sorts below the floor `[0x01]`. The
+/// runtime fn then raises the bound to the floor.
+pub fn below_floor(b: &[u8]) -> (r: bool)
+    ensures r <==> lex_lt(b@, seq![1u8]),
+{
+    proof {
+        let f = seq![1u8];
+        assert(f.len() == 1 && f[0] == 1u8);
+        assert(f.drop_first().len() == 0);
+        if b@.len() > 0 && b@[0] == 1u8 {
+            assert(!lex_lt(b@.drop_first(), f.drop_first()));
+        }
+    }
+    b.len() == 0 || b[0] == RESERVED
 }
 
 fn main() {}

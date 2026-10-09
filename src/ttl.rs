@@ -30,6 +30,30 @@ pub const fn expire_at(now: u64, ttl_secs: u64) -> u64 {
     }
 }
 
+/// The expiry tick for a value that must live at least `ttl_secs`.
+///
+/// The store clock counts whole seconds and drops the fraction, so the
+/// value lives at least `ttl_secs` and less than `ttl_secs + 1` seconds.
+#[must_use]
+pub const fn deadline(now: u64, ttl_secs: u64) -> u64 {
+    let plus_one = if ttl_secs == u64::MAX {
+        u64::MAX
+    } else {
+        ttl_secs + 1
+    };
+    expire_at(now, plus_one)
+}
+
+/// The purge limit: the store clock, but no later than the clock on disk.
+///
+/// Compaction purges entries that expired at or before this limit. After a
+/// restart the clock starts from the value on disk, so a purge never
+/// removes a value that a later read can see.
+#[must_use]
+pub const fn purge_limit(now: u64, durable: u64) -> u64 {
+    if durable < now { durable } else { now }
+}
+
 /// The next store-clock value. It never goes back.
 #[must_use]
 pub const fn advance(last: u64, wall: u64) -> u64 {
@@ -63,6 +87,19 @@ mod tests {
         assert_eq!(expire_at(10, 5), 15);
         assert_eq!(expire_at(u64::MAX, 5), u64::MAX);
         assert_eq!(expire_at(7, 0), 7);
+    }
+
+    #[test]
+    fn deadline_adds_one_second_for_the_dropped_fraction() {
+        assert_eq!(deadline(10, 1), 12);
+        assert_eq!(deadline(10, 0), 11);
+        assert_eq!(deadline(u64::MAX, u64::MAX), u64::MAX);
+    }
+
+    #[test]
+    fn purge_limit_is_the_smaller_clock() {
+        assert_eq!(purge_limit(10, 7), 7);
+        assert_eq!(purge_limit(7, 10), 7);
     }
 
     #[test]

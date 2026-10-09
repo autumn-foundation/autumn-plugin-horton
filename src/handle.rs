@@ -10,10 +10,9 @@ use tokio::sync::{mpsc, oneshot};
 
 use crate::config::HortonConfig;
 use crate::device::{FileDevice, IoStats};
-use crate::engine::{Engine, Entries, Reply, Request, Snapshot, TTL_BYTES};
+use crate::engine::{Engine, Entries, MAX_BATCH_BYTES, Reply, Request, Snapshot, TTL_BYTES};
 use crate::error::HortonError;
 use crate::keys::{self, check_app_key, check_value};
-use crate::shape::BLOCK;
 use crate::ttl;
 
 /// A clock in Unix seconds. [`Horton::open`] uses the system clock.
@@ -21,6 +20,10 @@ pub type Clock = Arc<dyn Fn() -> u64 + Send + Sync>;
 
 /// Requests that can wait in the queue. A full queue makes callers wait.
 const QUEUE: usize = 1024;
+
+/// The most entries one scan returns. Page through larger ranges: start
+/// the next scan after the last key.
+pub const SCAN_MAX: usize = 10_000;
 
 /// The store thread's stack. horton builds the database on the stack
 /// before the plugin boxes it.
@@ -35,13 +38,27 @@ pub enum BatchOp {
     PutTtl(Vec<u8>, Vec<u8>, u64),
     /// Delete a key.
     Delete(Vec<u8>),
+    /// Put a session and its sweep index entry. The store thread computes
+    /// the expiry, so both keys hold the same one.
+    SessionPut {
+        /// The session key.
+        key: Vec<u8>,
+        /// The SHA-256 of the session id.
+        id: Vec<u8>,
+        /// The session JSON.
+        val: Vec<u8>,
+        /// The TTL in seconds.
+        secs: u64,
+    },
 }
 
 /// Writes that apply together or not at all.
 ///
-/// The batch must fit one WAL block: 16 KiB, with 23 bytes of overhead
-/// for each op (31 for a TTL op). [`Horton::write`] refuses a larger
-/// batch with [`HortonError::BatchTooLarge`].
+/// The batch must fit one WAL block (16 KiB) with room for the store
+/// clock record: [`MAX_BATCH_BYTES`](crate::MAX_BATCH_BYTES)
+/// bytes. Each op takes 23 bytes of overhead, 31 for a TTL op, plus its
+/// key and value. [`Horton::write`] refuses a larger batch with
+/// [`HortonError::BatchTooLarge`].
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Batch {
     ops: Vec<BatchOp>,
@@ -78,8 +95,31 @@ impl Batch {
 
     /// The operations, in order.
     #[must_use]
-    pub fn ops(&self) -> &[BatchOp] {
+    pub(crate) fn ops(&self) -> &[BatchOp] {
         &self.ops
+    }
+
+    /// Adds a session save. The caller checked `key` and `id`.
+    pub(crate) fn session_put(&mut self, key: Vec<u8>, id: &[u8], val: &[u8], ttl: Duration) {
+        self.ops.push(BatchOp::SessionPut {
+            key,
+            id: id.to_vec(),
+            val: val.to_vec(),
+            secs: ttl::ttl_secs(ttl),
+        });
+    }
+
+    /// True when the batch stores data (it is not only deletes).
+    pub(crate) fn adds_data(&self) -> bool {
+        self.ops.iter().any(|op| !matches!(op, BatchOp::Delete(_)))
+    }
+
+    /// The horton ops this batch makes: a session save makes two.
+    pub(crate) fn horton_ops(&self) -> usize {
+        self.ops
+            .iter()
+            .map(|op| 1 + usize::from(matches!(op, BatchOp::SessionPut { .. })))
+            .sum()
     }
 
     /// The number of operations.
@@ -102,6 +142,16 @@ impl Batch {
                 BatchOp::Put(k, v) => WAL_RECORD_OVERHEAD + k.len() + v.len(),
                 BatchOp::PutTtl(k, v, _) => WAL_RECORD_OVERHEAD + TTL_BYTES + k.len() + v.len(),
                 BatchOp::Delete(k) => WAL_RECORD_OVERHEAD + k.len(),
+                BatchOp::SessionPut { key, id, val, .. } => {
+                    WAL_RECORD_OVERHEAD
+                        + TTL_BYTES
+                        + key.len()
+                        + val.len()
+                        + WAL_RECORD_OVERHEAD
+                        + keys::SESSION_INDEX.len()
+                        + 8
+                        + id.len()
+                }
             })
             .sum()
     }
@@ -112,13 +162,17 @@ impl Batch {
             let (key, val) = match op {
                 BatchOp::Put(k, v) | BatchOp::PutTtl(k, v, _) => (k.as_slice(), v.as_slice()),
                 BatchOp::Delete(k) => (k.as_slice(), &[][..]),
+                BatchOp::SessionPut { key, val, .. } => (key.as_slice(), val.as_slice()),
             };
             space.check_key(key)?;
             check_value(val)?;
         }
         let bytes = self.wal_bytes();
-        if bytes > BLOCK {
-            return Err(HortonError::BatchTooLarge { bytes, max: BLOCK });
+        if bytes > MAX_BATCH_BYTES {
+            return Err(HortonError::BatchTooLarge {
+                bytes,
+                max: MAX_BATCH_BYTES,
+            });
         }
         Ok(())
     }
@@ -192,17 +246,36 @@ pub struct Stats {
 }
 
 struct Inner {
-    tx: mpsc::Sender<Request>,
+    /// `None` only inside `Drop`.
+    tx: Option<mpsc::Sender<Request>>,
     thread: Mutex<Option<JoinHandle<()>>>,
     snapshot: Snapshot,
+}
+
+impl Drop for Inner {
+    /// The last handle is gone: stop the store thread and wait for it, so
+    /// the file lock is free when this returns. The thread only drops the
+    /// database; the WAL already holds every write.
+    fn drop(&mut self) {
+        drop(self.tx.take());
+        let thread = self
+            .thread
+            .get_mut()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take();
+        if let Some(thread) = thread {
+            let _ = thread.join();
+        }
+    }
 }
 
 /// A cloneable handle to an open store.
 ///
 /// Every call is `async` and does no I/O on the calling thread: a store
 /// thread does the work. The handle works on any async runtime. When the
-/// last clone drops, the store thread stops. Data is safe then, because
-/// every write is in the WAL before its call returns.
+/// last clone drops, the store thread stops and the file lock is free.
+/// Data is safe then, because every write is in the WAL before its call
+/// returns.
 #[derive(Clone)]
 pub struct Horton {
     inner: Arc<Inner>,
@@ -270,7 +343,7 @@ impl Horton {
         ready_rx.recv().map_err(|_| HortonError::Closed)??;
         Ok(Self {
             inner: Arc::new(Inner {
-                tx,
+                tx: Some(tx),
                 thread: Mutex::new(Some(thread)),
                 snapshot,
             }),
@@ -287,7 +360,8 @@ impl Horton {
         self.get_in(key).await
     }
 
-    /// Stores `key → val`. When this returns, the write is durable.
+    /// Stores `key → val`. When this returns, the write is in the WAL. With
+    /// `sync = true` the WAL is on disk.
     ///
     /// # Errors
     ///
@@ -326,7 +400,8 @@ impl Horton {
         self.write(b).await
     }
 
-    /// Applies `batch` atomically. When this returns, it is durable.
+    /// Applies `batch` atomically. When this returns, the batch is in the
+    /// WAL. With `sync = true` the WAL is on disk.
     ///
     /// # Errors
     ///
@@ -354,6 +429,8 @@ impl Horton {
 
     /// Up to `limit` entries of `[start, end)` in ascending key order. An
     /// empty `start` is the first key. `end = None` is past the last key.
+    /// One call returns at most [`SCAN_MAX`] entries. The store thread
+    /// does one scan at a time, so keep pages small.
     ///
     /// # Errors
     ///
@@ -392,8 +469,10 @@ impl Horton {
         self.call(Request::Flush).await
     }
 
-    /// Flushes, then compacts until no job is pending. Compaction also
-    /// purges expired values.
+    /// Flushes the memtable, then runs every pending compaction job. A job
+    /// is pending when a level is full or free slots are low. Each job also
+    /// purges the expired values in its tables. With no pending job, this
+    /// only flushes.
     ///
     /// # Errors
     ///
@@ -417,8 +496,8 @@ impl Horton {
     ///
     /// # Errors
     ///
-    /// [`HortonError::Store`] when the last flush fails. The store stops
-    /// all the same; the WAL holds the data.
+    /// [`HortonError::Store`] when the last flush fails. The store stops.
+    /// The WAL keeps the data.
     pub async fn close(&self) -> Result<(), HortonError> {
         let result = match self.call(Request::Close).await {
             Err(HortonError::Closed) => Ok(()),
@@ -451,7 +530,12 @@ impl Horton {
     /// True when the store thread has stopped.
     #[must_use]
     pub fn is_closed(&self) -> bool {
-        self.inner.tx.is_closed()
+        self.inner.tx.as_ref().is_none_or(mpsc::Sender::is_closed)
+    }
+
+    /// Deletes expired sessions and their index entries.
+    pub(crate) async fn sweep_sessions(&self) -> Result<u64, HortonError> {
+        self.call(Request::Sweep).await
     }
 
     pub(crate) async fn get_in(&self, key: &[u8]) -> Result<Option<Vec<u8>>, HortonError> {
@@ -484,6 +568,7 @@ impl Horton {
         }
         let start = keys::app_floor(start).to_vec();
         let end = end.map(<[u8]>::to_vec);
+        let limit = limit.min(SCAN_MAX);
         self.call(|reply| Request::Scan {
             start,
             end,
@@ -495,9 +580,11 @@ impl Horton {
     }
 
     async fn call<T>(&self, make: impl FnOnce(Reply<T>) -> Request) -> Result<T, HortonError> {
+        let Some(sender) = &self.inner.tx else {
+            return Err(HortonError::Closed);
+        };
         let (tx, rx) = oneshot::channel();
-        self.inner
-            .tx
+        sender
             .send(make(tx))
             .await
             .map_err(|_| HortonError::Closed)?;
@@ -505,10 +592,15 @@ impl Horton {
     }
 }
 
+/// Makes the parent directories. On Unix new directories have mode `0700`.
 fn make_parent(path: &Path) -> Result<(), HortonError> {
     match path.parent() {
         Some(dir) if !dir.as_os_str().is_empty() => {
-            std::fs::create_dir_all(dir).map_err(|e| HortonError::Open {
+            let mut builder = std::fs::DirBuilder::new();
+            builder.recursive(true);
+            #[cfg(unix)]
+            std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);
+            builder.create(dir).map_err(|e| HortonError::Open {
                 path: path.to_path_buf(),
                 reason: format!("cannot make {}: {e}", dir.display()),
             })

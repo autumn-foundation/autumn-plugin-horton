@@ -94,24 +94,26 @@ async fn data_survives_a_drop_without_close() {
         let db = t.open();
         db.put(b"k", b"v").await.expect("put");
     }
-    // The store thread stops when the last handle goes. Wait for the lock.
-    let db = open_when_free(&t.config()).await;
+    // No flush ran: the value and the clock record come back from the WAL.
+    let db = t.open();
     assert_eq!(db.get(b"k").await, Ok(Some(b"v".to_vec())));
-    // No flush ran: the value came back from the WAL.
-    assert_eq!(db.stats().await.expect("stats").recovered_records, 1);
+    assert_eq!(db.stats().await.expect("stats").recovered_records, 2);
+    db.close().await.expect("close");
 }
 
-async fn open_when_free(config: &HortonConfig) -> Horton {
-    for _ in 0..200 {
-        match Horton::open(config) {
-            Ok(db) => return db,
-            Err(HortonError::Locked { .. }) => {
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
-            Err(e) => panic!("open: {e}"),
-        }
+#[tokio::test]
+async fn dropping_the_last_handle_frees_the_file_at_once() {
+    let t = Temp::new();
+    for i in 0..20u8 {
+        let db = t.open();
+        db.put(&[b'k', i], b"v").await.expect("put");
+        let clone = db.clone();
+        drop(db);
+        drop(clone);
     }
-    panic!("the store stayed locked");
+    let db = t.open();
+    assert_eq!(db.scan(b"", None, 100).await.expect("scan").len(), 20);
+    db.close().await.expect("close");
 }
 
 #[tokio::test]
@@ -260,9 +262,15 @@ async fn ttl_values_expire_on_the_store_clock() {
     assert_eq!(db.get(b"short").await, Ok(Some(b"v".to_vec())));
     assert_eq!(db.get(b"sub-second").await, Ok(Some(b"v".to_vec())));
 
+    // A TTL lives at least its length: the clock drops the fraction of
+    // the second it was written in, so expiry is one second later.
     now.store(1_001, Ordering::SeqCst);
+    assert_eq!(db.get(b"sub-second").await, Ok(Some(b"v".to_vec())));
+    now.store(1_002, Ordering::SeqCst);
     assert_eq!(db.get(b"sub-second").await, Ok(None));
     now.store(1_010, Ordering::SeqCst);
+    assert_eq!(db.get(b"short").await, Ok(Some(b"v".to_vec())));
+    now.store(1_011, Ordering::SeqCst);
     assert_eq!(db.get(b"short").await, Ok(None));
     let keys: Vec<_> = db
         .scan(b"", None, 10)
@@ -276,15 +284,19 @@ async fn ttl_values_expire_on_the_store_clock() {
     // The clock never goes back: an expired value stays expired.
     now.store(5, Ordering::SeqCst);
     assert_eq!(db.get(b"short").await, Ok(None));
-    assert_eq!(db.stats().await.expect("stats").clock, 1_010);
+    assert_eq!(db.stats().await.expect("stats").clock, 1_011);
 
-    // Compaction purges it, and the value stays gone after a reopen.
-    db.compact().await.expect("compact");
+    // A write stores the clock. After a reopen with a wall clock that went
+    // back, the store clock starts from the stored value, so no expired
+    // value comes back. No compaction ran, so only the clock hides it.
+    db.put(b"tick", b"").await.expect("put");
     db.close().await.expect("close");
-    let (_now, clock) = manual_clock(2_000);
+    let (_now, clock) = manual_clock(5);
     let db = Horton::open_with_clock(&t.config(), clock).expect("reopen");
+    assert_eq!(db.stats().await.expect("stats").clock, 1_011);
     assert_eq!(db.get(b"short").await, Ok(None));
     assert_eq!(db.get(b"forever").await, Ok(Some(b"v".to_vec())));
+    db.close().await.expect("close");
 }
 
 #[tokio::test]
@@ -378,5 +390,30 @@ fn a_file_that_is_not_a_store_is_refused() {
 fn a_store_below_the_minimum_size_is_refused() {
     let t = Temp::new();
     let config = t.config().with_size_mib(1);
+    assert!(matches!(Horton::open(&config), Err(HortonError::Config(_))));
+}
+
+#[tokio::test]
+async fn a_scan_bound_over_the_key_limit_is_refused() {
+    let t = Temp::new();
+    let db = t.open();
+    let long = vec![b'k'; KEY_MAX + 1];
+    assert!(matches!(
+        db.scan(&long, None, 1).await,
+        Err(HortonError::KeyTooLarge { .. })
+    ));
+    assert!(matches!(
+        db.scan_rev(b"a", Some(&long), 1).await,
+        Err(HortonError::KeyTooLarge { .. })
+    ));
+    db.close().await.expect("close");
+}
+
+#[test]
+fn an_existing_store_below_the_minimum_is_refused() {
+    let t = Temp::new();
+    let config = t.config();
+    std::fs::create_dir_all(config.path.parent().expect("parent")).expect("mkdir");
+    drop(autumn_plugin_horton::device::FileDevice::open(&config.path, 16, false).expect("small"));
     assert!(matches!(Horton::open(&config), Err(HortonError::Config(_))));
 }

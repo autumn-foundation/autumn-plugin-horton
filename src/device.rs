@@ -1,10 +1,13 @@
 //! A horton [`BlockDevice`] over one file.
 //!
-//! Block `i` is bytes `i * BLOCK .. (i + 1) * BLOCK` of the file. Reads and
-//! writes use positioned I/O. A new file gets its full size at once; it is
-//! sparse, so unused blocks take no disk. `poll_flush` is `fdatasync`.
-//! The device holds an exclusive OS lock on the file while it is open.
-//! Every call completes before it returns.
+//! File block 0 is a header that marks the file as a plugin store. horton
+//! block `i` is file block `i + 1`. Reads and writes use positioned I/O.
+//! A new file gets its full size at once. On Linux and macOS the file is
+//! sparse, so unused blocks take no disk; on Windows they do. `poll_flush`
+//! is `fdatasync`. The device holds an exclusive OS lock on the file while
+//! it is open. Every call completes before it returns.
+//!
+//! On Unix a new file has mode `0600`: sessions are in it.
 
 use core::cell::Cell;
 use core::task::{Context, Poll};
@@ -16,6 +19,9 @@ use horton::BlockDevice;
 
 use crate::error::HortonError;
 use crate::shape::BLOCK;
+
+/// The start of file block 0. The rest of the block is zero.
+const MAGIC: &[u8] = b"autumn-plugin-horton store v1\n";
 
 /// A device failure. horton's error is `Copy`, so this keeps the kind only.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -68,20 +74,19 @@ impl FileDevice {
     /// # Errors
     ///
     /// [`HortonError::Locked`] when another store holds the file, and
-    /// [`HortonError::Open`] when the file cannot be opened, sized or is
-    /// not a whole number of blocks.
+    /// [`HortonError::Open`] when the plugin cannot open or size the
+    /// file, when the size is not a whole number of blocks, or when block
+    /// 0 is not the plugin header.
     pub fn open(path: &Path, create_blocks: u64, sync: bool) -> Result<Self, HortonError> {
         let open_err = |reason: String| HortonError::Open {
             path: path.to_path_buf(),
             reason,
         };
-        let file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(path)
-            .map_err(|e| open_err(e.to_string()))?;
+        let mut options = OpenOptions::new();
+        options.read(true).write(true).create(true).truncate(false);
+        #[cfg(unix)]
+        std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+        let file = options.open(path).map_err(|e| open_err(e.to_string()))?;
         match file.try_lock() {
             Ok(()) => {}
             Err(TryLockError::WouldBlock) => {
@@ -95,19 +100,29 @@ impl FileDevice {
         let mut len = file.metadata().map_err(|e| open_err(e.to_string()))?.len();
         if len == 0 {
             len = create_blocks
-                .checked_mul(block)
+                .checked_add(1)
+                .and_then(|b| b.checked_mul(block))
                 .ok_or_else(|| open_err("the size overflows u64".into()))?;
             file.set_len(len).map_err(|e| open_err(e.to_string()))?;
+            write_at(&file, MAGIC, 0).map_err(|e| open_err(e.to_string()))?;
             file.sync_all().map_err(|e| open_err(e.to_string()))?;
+            sync_parent(path).map_err(|e| open_err(e.to_string()))?;
         }
-        if len % block != 0 {
+        if len % block != 0 || len < block {
             return Err(open_err(format!(
                 "the file is {len} bytes, not a whole number of {BLOCK}-byte blocks"
             )));
         }
+        let mut head = [0u8; MAGIC.len()];
+        read_at(&file, &mut head, 0).map_err(|e| open_err(e.to_string()))?;
+        if head != MAGIC {
+            return Err(open_err(
+                "the file is not an autumn-plugin-horton store".into(),
+            ));
+        }
         Ok(Self {
             file,
-            blocks: len / block,
+            blocks: len / block - 1,
             sync,
             reads: Cell::new(0),
             writes: 0,
@@ -133,7 +148,7 @@ impl FileDevice {
 
     const fn offset(&self, op: &'static str, id: u64) -> Result<u64, IoError> {
         if id < self.blocks {
-            Ok(id * BLOCK as u64)
+            Ok((id + 1) * BLOCK as u64)
         } else {
             Err(IoError {
                 op,
@@ -142,6 +157,22 @@ impl FileDevice {
             })
         }
     }
+}
+
+/// Makes a new file's directory entry durable.
+#[cfg(unix)]
+fn sync_parent(path: &Path) -> io::Result<()> {
+    match path.parent() {
+        Some(dir) if !dir.as_os_str().is_empty() => File::open(dir)?.sync_all(),
+        _ => File::open(".")?.sync_all(),
+    }
+}
+
+/// NTFS makes a new directory entry durable with the file.
+#[cfg(windows)]
+#[allow(clippy::unnecessary_wraps, reason = "same signature as the unix half")]
+const fn sync_parent(_path: &Path) -> io::Result<()> {
+    Ok(())
 }
 
 #[cfg(unix)]
@@ -318,5 +349,48 @@ mod tests {
             FileDevice::open(dir.path(), 4, false),
             Err(HortonError::Open { .. })
         ));
+    }
+
+    #[test]
+    fn a_file_without_the_header_is_refused() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("other.bin");
+        // A whole number of blocks, but not a store: never adopt it.
+        std::fs::write(&path, vec![7u8; 3 * BLOCK]).expect("write");
+        let Err(HortonError::Open { reason, .. }) = FileDevice::open(&path, 4, false) else {
+            panic!("a foreign file opened");
+        };
+        assert!(
+            reason.contains("not an autumn-plugin-horton store"),
+            "{reason}"
+        );
+        assert_eq!(std::fs::read(&path).expect("read"), vec![7u8; 3 * BLOCK]);
+    }
+
+    #[test]
+    fn the_header_is_block_zero_and_reopens() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("d.horton");
+        drop(FileDevice::open(&path, 4, false).expect("create"));
+        let bytes = std::fs::read(&path).expect("read");
+        assert_eq!(bytes.len(), 5 * BLOCK);
+        assert!(bytes.starts_with(MAGIC));
+        assert_eq!(
+            FileDevice::open(&path, 9, false).expect("reopen").blocks(),
+            4
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_new_file_is_private() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let _d = dev(&dir, false);
+        let mode = std::fs::metadata(dir.path().join("d.horton"))
+            .expect("metadata")
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o600);
     }
 }

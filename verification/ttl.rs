@@ -2,11 +2,13 @@ use vstd::prelude::*;
 
 verus! {
 
-// Model of `src/ttl.rs`. Each exec fn has the same body as the runtime
-// fn of the same name. horton reads `expire_at == 0` as "no expiry", and
-// compaction purges with the store clock. Thus:
+// Model of `src/ttl.rs`. Each exec fn is equivalent to the runtime fn of
+// the same name. horton reads `expire_at == 0` as "no expiry". Compaction
+// purges with the purge limit. The proofs show:
 // - a TTL never gives expiry 0 (R11);
-// - the store clock never goes back (R12).
+// - a value lives at least its TTL;
+// - the store clock never goes back (R12);
+// - a purge never removes a value that a later read can see.
 
 /// `ttl_secs`: whole seconds, rounded up. `secs` and `nanos` are the parts
 /// of a `Duration`.
@@ -42,6 +44,45 @@ pub fn expire_at(now: u64, ttl: u64) -> (r: u64)
         now + ttl
     }
 }
+
+/// `deadline`: the expiry for a write at clock `now` that must live at
+/// least `ttl` seconds. The clock drops the fraction of a second, so it
+/// adds one second.
+pub fn deadline(now: u64, ttl: u64) -> (r: u64)
+    ensures
+        r != 0,
+        r >= now,
+        now as int + ttl as int + 1 <= u64::MAX as int ==> r as int == now as int + ttl as int + 1,
+{
+    let plus_one = if ttl == u64::MAX { u64::MAX } else { ttl + 1 };
+    expire_at(now, plus_one)
+}
+
+/// A value with expiry `now + ttl + 1` is visible at every clock from
+/// `now` to `now + ttl`: it lives at least `ttl` seconds.
+pub proof fn lives_at_least(now: u64, ttl: u64, t: u64)
+    requires
+        now as int + ttl as int + 1 <= u64::MAX as int,
+        now <= t,
+        t as int <= now as int + ttl as int,
+    ensures visible((now as int + ttl as int + 1) as u64, t),
+{}
+
+/// `purge_limit`: compaction purges entries that expired at or before
+/// this. It is the store clock, but no later than the clock on disk.
+pub fn purge_limit(now: u64, durable: u64) -> (r: u64)
+    ensures r <= now, r <= durable, r == now || r == durable,
+{
+    if durable < now { durable } else { now }
+}
+
+/// After a restart the store clock starts at `advance(durable, wall)`.
+/// That is at least every purge limit before the restart, so an entry a
+/// purge removed was already invisible to every later read.
+pub proof fn purge_survives_restart(now: u64, durable: u64, wall: u64, expire: u64)
+    requires purged(expire, if durable < now { durable } else { now }),
+    ensures !visible(expire, advance_spec(durable, wall)),
+{}
 
 /// `advance`: the next store-clock value.
 pub fn advance(last: u64, wall: u64) -> (r: u64)

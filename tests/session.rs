@@ -73,12 +73,11 @@ async fn sessions_never_show_in_app_scans_or_reads() {
 }
 
 #[tokio::test]
-async fn bad_ids_and_large_sessions_are_errors() {
+async fn large_sessions_and_bad_save_ids_are_errors() {
     let dir = tempfile::tempdir().expect("tempdir");
     let db = Horton::open(&config(&dir)).expect("open");
     let store = HortonSessionStore::new(db.clone(), Duration::from_secs(60));
-    assert!(store.load("").await.is_err());
-    assert!(store.load(&"x".repeat(200)).await.is_err());
+    assert!(store.save("", data(&[("k", "v")])).await.is_err());
     let big = data(&[("blob", &"x".repeat(5000))]);
     assert!(store.save("big", big).await.is_err());
     db.close().await.expect("close");
@@ -100,9 +99,11 @@ async fn sessions_expire_after_max_age() {
     .expect("open");
     let store = HortonSessionStore::new(db.clone(), Duration::from_secs(30));
     store.save("s", data(&[("k", "v")])).await.expect("save");
-    now.store(129, std::sync::atomic::Ordering::SeqCst);
-    assert!(store.load("s").await.expect("load").is_some());
+    // The clock drops the fraction of a second, so a session lives at
+    // least `max_age` and less than one second more.
     now.store(130, std::sync::atomic::Ordering::SeqCst);
+    assert!(store.load("s").await.expect("load").is_some());
+    now.store(131, std::sync::atomic::Ordering::SeqCst);
     assert_eq!(store.load("s").await, Ok(None));
     db.close().await.expect("close");
 }
@@ -151,5 +152,27 @@ async fn autumn_sessions_survive_a_restart() {
     ));
     let third = app.get("/bump").header("cookie", &cookie).send().await;
     assert_eq!(third.text(), "3");
+    db.close().await.expect("close");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_bad_session_cookie_starts_a_new_session() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let db = Horton::open(&config(&dir)).expect("open");
+    let store = HortonSessionStore::new(db.clone(), Duration::from_secs(3600));
+    let app = client(store.clone());
+    let cookie = SessionConfig::default().cookie_name;
+    for id in [String::new(), "x".repeat(200)] {
+        let res = app
+            .get("/bump")
+            .header("cookie", &format!("{cookie}={id}"))
+            .send()
+            .await;
+        res.assert_ok();
+        assert_eq!(res.text(), "1", "id of {} bytes", id.len());
+    }
+    // The trait answers the same way: unknown, not broken.
+    assert_eq!(store.load(&"x".repeat(200)).await, Ok(None));
+    assert_eq!(store.destroy("").await, Ok(()));
     db.close().await.expect("close");
 }

@@ -114,3 +114,36 @@ fn a_locked_store_stops_startup() {
         .plugin(HortonPlugin::new().fixed_config(config))
         .build();
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn sessions_on_opens_the_store_and_starts_the_sweep() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let on = HortonPlugin::new().fixed_config(
+        HortonConfig::default()
+            .with_path(dir.path().join("s.horton"))
+            .with_size_mib(HortonConfig::min_size_mib())
+            .with_sync(false)
+            .with_sessions(true),
+    );
+    let app = TestApp::new().plugin(on).build();
+    let db = app.state().extension::<Horton>().expect("handle");
+    // Session keys are plugin keys: the app sees none.
+    assert_eq!(db.scan(b"", None, 10).await, Ok(Vec::new()));
+    db.close().await.expect("close");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_builder_path_resolves_files_and_env() {
+    // No `autumn.toml` in the crate root and no AUTUMN_HORTON__* in CI:
+    // the builder values win.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("b.horton");
+    let plugin = HortonPlugin::new()
+        .path(&path)
+        .size_mib(HortonConfig::min_size_mib())
+        .sync(false);
+    let app = TestApp::new().plugin(plugin).build();
+    let db = app.state().extension::<Horton>().expect("handle");
+    assert!(path.exists());
+    db.close().await.expect("close");
+}

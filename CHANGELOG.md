@@ -5,8 +5,6 @@ The crate follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
-## [0.1.0]
-
 ### Added
 
 - `HortonPlugin`: opens a horton store at startup, puts a `Horton` handle
@@ -22,5 +20,11 @@ The crate follows [Semantic Versioning](https://semver.org/).
 - The `horton` health indicator and the `horton_*` metrics.
 - `[horton]` config with profile layers and `AUTUMN_HORTON__*` variables.
 - An exclusive file lock: a second open of one store fails.
-- Verus proofs for TTL expiry, the store clock, key namespaces and
-  group-commit sizing.
+- Verus proofs for TTL expiry, the store clock, the purge limit, key
+  namespaces and group-commit sizing.
+- A store quota: at `RESERVE_SLOTS` free slots, writes that add data fail
+  with `StoreFull`. Reads and deletes still work.
+- A session sweep (`HortonSessionStore::sweep`, every `SWEEP_EVERY`).
+- `HortonError::status` and `HortonError::into_autumn`.
+- The store keeps the SHA-256 of each session id, not the id.
+- The store clock is on disk and never goes back after a restart.

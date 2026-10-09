@@ -35,8 +35,9 @@ pub struct HortonConfig {
     /// The store file. A relative path starts at the working directory.
     /// The plugin makes the parent directories.
     pub path: PathBuf,
-    /// The size of a new store file, in MiB. The file is sparse. An
-    /// existing file keeps its size.
+    /// The size of a new store file, in MiB. On Linux and macOS the file
+    /// is sparse. On Windows, NTFS uses the full size. An existing file
+    /// keeps its size.
     pub size_mib: u64,
     /// `fdatasync` every commit. `false` is faster, but a power cut can
     /// lose the last writes. A process crash loses nothing.
@@ -147,9 +148,11 @@ impl HortonConfig {
     ///
     /// # Errors
     ///
-    /// [`HortonError::Config`] when a file cannot be read or parsed, when
-    /// `[horton]` has an unknown key or a bad type, when an environment
-    /// value does not parse, or when [`validate`](Self::validate) fails.
+    /// [`HortonError::Config`] when:
+    /// - the plugin cannot read or parse a config file;
+    /// - `[horton]` has an unknown key or a value of the wrong type;
+    /// - an `AUTUMN_HORTON__*` value does not parse;
+    /// - [`validate`](Self::validate) fails.
     pub fn resolve_with_env(self, env: &dyn Env) -> Result<Self, HortonError> {
         let mut merged = toml::Table::new();
         merged.insert(

@@ -49,3 +49,17 @@ fn details<const N: usize>(
 ) -> HashMap<String, serde_json::Value> {
     pairs.into_iter().map(|(k, v)| (k.to_owned(), v)).collect()
 }
+
+#[cfg(test)]
+mod tests {
+    use autumn_web::actuator::HealthStatus;
+
+    use super::*;
+
+    #[tokio::test]
+    async fn a_store_that_is_not_open_is_down() {
+        let out = HortonHealth::new(Slot::default()).check().await;
+        assert_eq!(out.status, HealthStatus::Down);
+        assert_eq!(out.details["reason"], "not open");
+    }
+}

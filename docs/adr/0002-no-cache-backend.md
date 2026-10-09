@@ -17,5 +17,5 @@ v0.1 does not implement `Cache`. Apps keep the in-memory `moka` cache.
 ## Consequences
 
 - The plugin never blocks a Tokio worker.
-- A persistent cache is out of scope. We can add it when Autumn has an
+- We do not add a persistent cache now. We can add it when Autumn has an
   async cache trait.

@@ -5,9 +5,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use autumn_web::app::AppBuilder;
-use autumn_web::config::AutumnConfig;
 use autumn_web::plugin::Plugin;
 use autumn_web::plugin_contract::PluginContract;
+use autumn_web::session::SessionBackend;
 use autumn_web::{AppState, AutumnError};
 
 use crate::config::{HortonConfig, SECTION};
@@ -15,7 +15,7 @@ use crate::error::HortonError;
 use crate::handle::Horton;
 use crate::health::HortonHealth;
 use crate::metrics::HortonMetrics;
-use crate::session::HortonSessionStore;
+use crate::session::{HortonSessionStore, SWEEP_EVERY};
 use crate::slot::Slot;
 
 /// The plugin and crate name.
@@ -77,7 +77,7 @@ impl HortonPlugin {
         self
     }
 
-    /// Uses `config` as is. The plugin then reads no file and no
+    /// Uses `config` with no change. The plugin then reads no file and no
     /// environment variable.
     pub fn fixed_config(mut self, config: HortonConfig) -> Self {
         self.config = config;
@@ -156,17 +156,36 @@ async fn start(
         .await
         .map_err(|e| AutumnError::internal_server_error_msg(format!("horton open task: {e}")))?
         .map_err(fail)?;
-    if let Some(store) = &sessions {
-        let max_age = state.extension::<AutumnConfig>().map_or_else(
-            || state.config().session.max_age_secs,
-            |c| c.session.max_age_secs,
-        );
-        store.set_max_age(Duration::from_secs(max_age));
-    }
     slot.set(db.clone());
+    if let Some(store) = &sessions {
+        let session = state.config().session;
+        if session.backend != SessionBackend::Memory {
+            tracing::warn!(
+                backend = ?session.backend,
+                "horton sessions = true: the horton store replaces the [session] backend"
+            );
+        }
+        store.set_max_age(Duration::from_secs(session.max_age_secs));
+        tokio::spawn(sweep_loop(store.clone()));
+    }
     state.insert_extension(db);
     tracing::info!(path = %path.display(), "horton store open");
     Ok(())
+}
+
+/// Sweeps expired sessions every [`SWEEP_EVERY`] until the store closes.
+async fn sweep_loop(store: HortonSessionStore) {
+    let mut every = tokio::time::interval(SWEEP_EVERY);
+    every.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        every.tick().await;
+        match store.sweep().await {
+            Ok(0) => {}
+            Ok(n) => tracing::debug!(sessions = n, "horton swept expired sessions"),
+            Err(HortonError::Closed | HortonError::NotStarted) => return,
+            Err(e) => tracing::warn!(error = %e, "horton session sweep failed"),
+        }
+    }
 }
 
 /// Flushes and closes the store.
@@ -221,6 +240,24 @@ mod tests {
         .expect("start");
         assert!(format!("{store:?}").contains("max_age_secs: 86400"));
         stop(slot).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_sweep_loop_ends_when_the_store_closes() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let slot = Slot::default();
+        let store = HortonSessionStore::pending(slot.clone());
+        // Not open yet: the loop ends at once.
+        sweep_loop(store.clone()).await;
+        start(AppState::for_test(), config(&dir), slot.clone(), None)
+            .await
+            .expect("start");
+        let task = tokio::spawn(sweep_loop(store));
+        stop(slot).await;
+        tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .expect("the loop ends")
+            .expect("join");
     }
 
     #[test]

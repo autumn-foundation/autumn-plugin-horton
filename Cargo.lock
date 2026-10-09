@@ -158,6 +158,7 @@ dependencies = [
  "proptest",
  "serde",
  "serde_json",
+ "sha2",
  "tempfile",
  "thiserror",
  "tokio",
@@ -1202,8 +1203,9 @@ dependencies = [
 
 [[package]]
 name = "horton"
-version = "0.17.0"
-source = "git+https://github.com/madmax983/horton?rev=3f682a10ed64f594714078e0debc35966c013de1#3f682a10ed64f594714078e0debc35966c013de1"
+version = "0.18.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "79f0c579a416fc3304c4a708085a239a37d532e9d8c7f36cb1a581fd0b662d7c"
 dependencies = [
  "loom",
 ]

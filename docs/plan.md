@@ -37,7 +37,7 @@ mitigation. Each mitigation has a test or a proof.
 | # | How to make it fail | Mitigation | Evidence |
 |---|---|---|---|
 | R1 | Do disk I/O on a Tokio worker thread | One dedicated store thread owns the database. Callers wait on a oneshot channel | `store` tests on a current-thread runtime |
-| R2 | Lose a write that returned `Ok` | Reply only after the WAL commit and `fdatasync` | Reopen test |
+| R2 | Lose a write that returned `Ok` | Reply only after the WAL commit (and `fdatasync` with `sync = true`) | Reopen test |
 | R3 | Open one file from two processes | Take an exclusive OS file lock. A second open fails | Lock test |
 | R4 | Change the file size after creation | Keep the size of an existing file. Log a warning if the config differs | Reopen-with-new-size test |
 | R5 | Overflow the stack when the database is built | Build it on a store thread with a 64 MiB stack, then box it | Every test opens a store |
@@ -84,7 +84,7 @@ mitigation. Each mitigation has a test or a proof.
 - Write a Verus spec and proof for each critical invariant: TTL expiry, the monotonic clock, key namespaces and group-commit fit.
 - For each feature: a failing test (RED), the smallest working code (GREEN), then a refactor with all tests and proofs green.
 - CI: fmt, clippy (pedantic and nursery), tests on three operating systems, docs, coverage of at least 85 %, MSRV and Verus.
-- Review with agents from several angles. Stop after 2 or 3 rounds.
+- Review with agents: engine, Autumn integration, security, tests and docs. Stop after 2 or 3 rounds.
 - Give evidence for each AC.
 
 ## 4. Design
@@ -115,3 +115,25 @@ Modules:
 | `session` | `HortonSessionStore` |
 | `health`, `metrics` | Actuator integration |
 | `plugin` | `HortonPlugin` |
+
+## 5. Review findings (round 1)
+
+Four review agents read the code: engine, Autumn integration, security,
+and tests with docs. Each finding has a fix and a test.
+
+| # | Finding | Fix | Evidence |
+|---|---|---|---|
+| F1 | A full store locks up (`RegionFull`): no write works again | Quota (`StoreFull`), session sweep (ADR 0004); horton#32 for 0.19 | `tests/full.rs` |
+| F2 | The clock restarts from the wall clock: expired values come back | The clock is on disk; purge limit = `min(clock, clock on disk)` | `ttl_values_expire_on_the_store_clock`, Verus `purge_survives_restart` |
+| F3 | Dropping the last handle frees the lock later | `Drop` joins the store thread | `dropping_the_last_handle_frees_the_file_at_once` |
+| F4 | A bad session cookie gives 503 on every request | `load` gives `None`, `destroy` gives `Ok` | `a_bad_session_cookie_starts_a_new_session` |
+| F5 | A TTL can end up to 1 s early | `deadline = now + ttl + 1` | Verus `lives_at_least`, `deadline_*` tests |
+| F6 | The store file is world-readable and holds raw session ids | Mode `0600`/`0700`; SHA-256 of the id | `a_new_file_is_private`, `session_keys_are_reserved_and_bounded` |
+| F7 | A foreign file of whole blocks is adopted and overwritten | Header block 0 | `a_file_without_the_header_is_refused` |
+| F8 | Metrics can lag the reply | Publish stats before each reply | `metrics_export_horton_families` |
+| F9 | One scan can hold the store thread | `SCAN_MAX` | `scans_respect_bounds_limits_and_direction` |
+| F10 | No directory fsync for a new file | `sync_parent` on Unix | code review |
+| F11 | No conformance test | `tests/conformance.rs` | CI |
+| F12 | Session wiring through `app().run()` is untested | `scripts/smoke-sessions.sh` in CI | CI |
+| F13 | Verus floats to the newest release; floor and order unproved | Pinned tag; `below_floor`, `plugin_keys_sort_below_app_keys` | CI `Verus proofs` |
+| F14 | Docs: "sparse", "durable", strict config, hot upgrade, one store per app | README "Operations", "Sessions", limits | README |
