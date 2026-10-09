@@ -606,3 +606,93 @@ impl Room {
         Ok(p)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    use super::*;
+
+    fn engine(dir: &tempfile::TempDir, now: &Arc<AtomicU64>) -> Engine {
+        let blocks = ShapeDb::<FileDevice>::MIN_DEVICE_BLOCKS;
+        let device = FileDevice::open(&dir.path().join("e.horton"), blocks, false).expect("device");
+        let read = Arc::clone(now);
+        Engine::open(
+            device,
+            Arc::new(move || read.load(Ordering::SeqCst)),
+            Snapshot::default(),
+        )
+        .expect("engine")
+    }
+
+    /// The raw value, at clock 0: a TTL value that is only hidden still
+    /// reads back; a purged one does not.
+    fn raw(e: &Engine, key: &[u8]) -> Option<Vec<u8>> {
+        let mut buf = vec![0u8; VAL_MAX];
+        block_on(e.db.get_with_time(key, &mut buf, 0))
+            .expect("get")
+            .map(|n| buf[..n].to_vec())
+    }
+
+    /// Runs `f` on a thread with the store thread's stack: horton builds
+    /// the database on the stack.
+    fn on_store_stack(f: impl FnOnce() + Send + 'static) {
+        std::thread::Builder::new()
+            .stack_size(64 << 20)
+            .spawn(f)
+            .expect("spawn")
+            .join()
+            .expect("the test thread panicked");
+    }
+
+    #[test]
+    fn compaction_purges_expired_values_up_to_the_clock_on_disk() {
+        on_store_stack(purges_up_to_the_clock_on_disk);
+    }
+
+    #[test]
+    fn a_hidden_value_stays_on_disk_until_a_purge() {
+        on_store_stack(hidden_until_purge);
+    }
+
+    fn purges_up_to_the_clock_on_disk() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let now = Arc::new(AtomicU64::new(1_000));
+        let mut e = engine(&dir, &now);
+        let ttl = [BatchOp::PutTtl(b"ttl".to_vec(), b"v".to_vec(), 1)];
+        e.commit(ttl.iter()).expect("put");
+        // Expired, but no clock on disk past its expiry yet: no purge.
+        now.store(2_000, Ordering::SeqCst);
+        e.tick();
+        assert_eq!(e.purge(), 1_000);
+        // Writes store the clock; flushes fill level 0 until a job runs.
+        let mut i = 0u32;
+        while e.room.jobs == 0 {
+            let put = [BatchOp::Put(format!("k{i:04}").into_bytes(), vec![1; 64])];
+            e.commit(put.iter()).expect("put");
+            let purge = e.purge();
+            e.room.flush(&mut e.db, purge).expect("flush");
+            while e.db.compaction_pending() {
+                e.room.job(&mut e.db, purge).expect("job");
+            }
+            i += 1;
+            assert!(i < 64, "no compaction job ran");
+        }
+        assert_eq!(e.purge(), 2_000);
+        assert_eq!(raw(&e, b"ttl"), None, "the job purged the expired value");
+        assert_eq!(raw(&e, b"k0000"), Some(vec![1; 64]));
+    }
+
+    fn hidden_until_purge() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let now = Arc::new(AtomicU64::new(1_000));
+        let mut e = engine(&dir, &now);
+        let ttl = [BatchOp::PutTtl(b"ttl".to_vec(), b"v".to_vec(), 1)];
+        e.commit(ttl.iter()).expect("put");
+        now.store(2_000, Ordering::SeqCst);
+        e.tick();
+        assert_eq!(e.get(b"ttl").expect("get"), None, "hidden at the clock");
+        assert_eq!(raw(&e, b"ttl"), Some(b"v".to_vec()), "but not purged");
+    }
+}

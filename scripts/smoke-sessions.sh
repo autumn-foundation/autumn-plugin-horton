@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
-# End-to-end check: a real `app().run()` keeps sessions in horton, and a
-# session survives a restart. Needs `cargo build --example visits` first.
+# End-to-end check: a real `app().run()` keeps sessions in horton. A
+# session survives a clean restart and a `kill -9` (sync = true: a reply
+# means the write is on disk). Needs `cargo build --example visits` first.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 bin=target/debug/examples/visits
@@ -21,6 +22,10 @@ stop() {
   kill -INT "$pid"
   wait "$pid" || true
 }
+crash() {
+  kill -9 "$pid"
+  wait "$pid" || true
+}
 check() {
   local got
   got="$(curl -s -c "$jar" -b "$jar" "localhost:$port/me")"
@@ -36,4 +41,10 @@ start
 check 3
 stop
 grep -q "shutdown: all phases completed cleanly" target/smoke.log
-echo "sessions survive a restart"
+start
+check 4
+crash
+start
+check 5
+stop
+echo "sessions survive a restart and a kill -9"
