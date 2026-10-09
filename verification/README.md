@@ -17,4 +17,4 @@ scripts/verify-verus.sh                   # uses `verus` on PATH
 VERUS_BIN=/path/to/verus scripts/verify-verus.sh
 ```
 
-CI runs the same script in the `verus` job of `.github/workflows/ci.yml`, with one pinned Verus release.
+CI runs the same script in the `verus` job of `.github/workflows/ci.yml`. It uses the pinned Verus release while that release exists. Verus deletes old rolling releases; CI then uses the newest one and prints a warning to move the pin.

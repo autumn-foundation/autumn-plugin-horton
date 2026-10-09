@@ -101,9 +101,21 @@ jobs:
         run: |
           dir="$RUNNER_TEMP/verus"
           mkdir -p "$dir"
-          # One pinned release, so a new Verus cannot turn CI red. Move the
-          # pin on purpose and re-run the proofs.
-          tag="release/rolling/0.2026.10.09.65fafde"
+          # Verus publishes rolling releases and deletes old ones, so an
+          # exact pin can vanish. Use the known-good tag while it exists;
+          # else the newest release with a Linux asset, with a warning.
+          pinned="release/rolling/0.2026.10.09.65fafde"
+          if gh release view "$pinned" --repo verus-lang/verus > /dev/null 2>&1; then
+            tag="$pinned"
+          else
+            tag="$(gh api 'repos/verus-lang/verus/releases?per_page=30' \
+              --jq '[.[] | select(any(.assets[]; .name | endswith("x86-linux.zip")))][0].tag_name')"
+            if [ -z "$tag" ] || [ "$tag" = "null" ]; then
+              echo "::error::no Verus release has an x86-linux.zip asset"
+              exit 1
+            fi
+            echo "::warning::Verus $pinned is gone; using $tag. Move the pin."
+          fi
           echo "Verus release: $tag"
           gh release download "$tag" --repo verus-lang/verus --pattern '*x86-linux.zip' --dir "$dir"
           unzip -q "$dir"/*.zip -d "$dir"
