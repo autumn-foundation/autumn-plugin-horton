@@ -127,7 +127,7 @@ const FLOOR: &[u8] = &[RESERVED + 1];
 /// Raises a scan bound to the app floor. App scans never see plugin keys.
 /// `verification/keys.rs` models the test as `below_floor`.
 #[must_use]
-pub fn app_floor(bound: &[u8]) -> &[u8] {
+pub const fn app_floor(bound: &[u8]) -> &[u8] {
     if bound.is_empty() || bound[0] == RESERVED {
         FLOOR
     } else {

@@ -7,7 +7,7 @@ An Autumn 0.8 plugin for the horton key-value store. Read `README.md`
 
 ```sh
 cargo fmt --all --check
-cargo clippy --all-targets -- -D warnings      # pedantic + nursery from Cargo.toml
+cargo +stable clippy --all-targets -- -D warnings   # CI uses stable: new lints land there
 RUSTDOCFLAGS="-D warnings" cargo doc --no-deps
 cargo test --all-targets && cargo test --doc   # Linux, macOS, Windows in CI
 cargo +1.89 check --lib                        # MSRV
