@@ -1,0 +1,42 @@
+[package]
+name = "autumn-plugin-horton"
+version = "0.1.0"
+edition = "2024"
+# `std::fs::File::try_lock` (the single-process guard) is stable from 1.89.
+rust-version = "1.89"
+description = "Autumn plugin: an embedded, durable horton key-value store and session store"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/autumn-foundation/autumn-plugin-horton"
+readme = "README.md"
+keywords = ["autumn", "plugin", "key-value", "lsm", "session"]
+categories = ["web-programming", "database-implementations"]
+exclude = [".github/", "CLAUDE.md", "verification/", "docs/plan.md"]
+
+[dependencies]
+# Lean: the plugin uses only the always-on surfaces (plugin, actuator,
+# session, config, test). The app's own features unify on top.
+autumn-web = { version = "0.8.0", default-features = false }
+# Until horton 0.17 is on crates.io: the release commit on GitHub.
+horton = { version = "0.17.0", git = "https://github.com/madmax983/horton", rev = "3f682a10ed64f594714078e0debc35966c013de1" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+tokio = { version = "1", features = ["sync", "rt", "macros"] }
+toml = "1.1"
+tracing = "0.1"
+
+[dev-dependencies]
+proptest = "1"
+tempfile = "3"
+tokio = { version = "1", features = ["full", "test-util"] }
+
+[lints.rust]
+unsafe_code = "forbid"
+missing_docs = "warn"
+
+[lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+nursery = { level = "warn", priority = -1 }
+unwrap_used = "warn"
+expect_used = "warn"
+panic = "warn"
