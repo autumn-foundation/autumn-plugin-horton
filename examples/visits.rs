@@ -47,13 +47,15 @@ async fn me(session: Session) -> String {
 
 #[autumn_web::main]
 async fn main() {
-    autumn_web::app()
-        .plugin(
-            HortonPlugin::new()
-                .path("target/visits.horton")
-                .sessions(true),
-        )
-        .routes(routes![visits, me])
-        .run()
-        .await;
+    Box::pin(
+        autumn_web::app()
+            .plugin(
+                HortonPlugin::new()
+                    .path("target/visits.horton")
+                    .sessions(true),
+            )
+            .routes(routes![visits, me])
+            .run(),
+    )
+    .await;
 }

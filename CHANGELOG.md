@@ -5,6 +5,10 @@ The crate follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Changed
+
+- Support `autumn-web` 0.9. The plugin now needs `autumn-web` 0.9.
+
 ### Added
 
 - `HortonPlugin`: opens a horton store at startup, puts a `Horton` handle
