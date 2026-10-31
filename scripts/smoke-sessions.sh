@@ -13,7 +13,9 @@ start() {
   AUTUMN_SERVER__PORT=$port "$bin" > target/smoke.log 2>&1 &
   pid=$!
   for _ in $(seq 1 60); do
-    curl -s -o /dev/null "localhost:$port/actuator/health" && return 0
+    # autumn 0.9 binds the port before the startup hooks run, and answers
+    # 503 until they finish. Wait for a 2xx.
+    curl -sf -o /dev/null "localhost:$port/actuator/health" && return 0
     sleep 0.5
   done
   echo "the app did not start"; cat target/smoke.log; exit 1
