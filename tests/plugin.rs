@@ -21,14 +21,14 @@ fn plugin(dir: &tempfile::TempDir) -> HortonPlugin {
 }
 
 #[test]
-fn the_contract_names_the_crate_and_autumn_0_8() {
+fn the_contract_names_the_crate_and_autumn_0_9() {
     let contract = HortonPlugin::new().contract().expect("contract");
     assert_eq!(contract.plugin, "autumn-plugin-horton");
     assert_eq!(
         contract.plugin_version.as_deref(),
         Some(env!("CARGO_PKG_VERSION"))
     );
-    assert_eq!(contract.autumn_web.as_deref(), Some("0.8"));
+    assert_eq!(contract.autumn_web.as_deref(), Some("0.9"));
     assert_eq!(HortonPlugin::new().name(), "autumn-plugin-horton");
 }
 
@@ -46,7 +46,10 @@ async fn startup_puts_a_working_handle_in_app_state() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn health_reports_up_then_down() {
     let dir = tempfile::tempdir().expect("tempdir");
-    let app = TestApp::new().plugin(plugin(&dir)).build();
+    // Autumn 0.9 caches health results for 1 s. The test reads twice.
+    let mut config = autumn_web::config::AutumnConfig::default();
+    config.health.cache_ttl_ms = 0;
+    let app = TestApp::new().config(config).plugin(plugin(&dir)).build();
     let body = app.get("/actuator/health").send().await.text();
     let json: serde_json::Value = serde_json::from_str(&body).expect("json");
     assert_eq!(json["components"]["horton"]["status"], "UP", "{body}");
