@@ -29,7 +29,7 @@ autumn-plugin-horton = "0.1"
 Condensed from [`examples/visits.rs`](examples/visits.rs), which also
 counts visits per session. Run it with `cargo run --example visits`.
 
-```rust,ignore
+```rust,no_run
 use autumn_plugin_horton::{Horton, HortonError, HortonPlugin};
 use autumn_web::prelude::*;
 use autumn_web::reexports::axum::extract::State;
