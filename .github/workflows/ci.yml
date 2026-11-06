@@ -58,15 +58,15 @@ jobs:
         run: cargo build --locked --example visits && ./scripts/smoke-sessions.sh
 
   msrv:
-    name: msrv (1.89)
+    name: msrv (1.97)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: "1.89"
+          toolchain: "1.97"
       - uses: Swatinem/rust-cache@v2
-      - run: cargo +1.89 check --locked --lib
+      - run: cargo +1.97 check --locked --lib
 
   coverage:
     name: coverage (85 % lines)

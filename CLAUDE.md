@@ -1,6 +1,6 @@
 # autumn-plugin-horton
 
-An Autumn 0.9 plugin for the horton key-value store. Read `README.md`
+An Autumn 0.10 plugin for the horton key-value store. Read `README.md`
 (use), `docs/plan.md` (plan and risks) and `docs/adr/` (decisions).
 
 ## Before you push: what CI runs
@@ -10,7 +10,7 @@ cargo fmt --all --check
 cargo +stable clippy --all-targets -- -D warnings   # CI uses stable: new lints land there
 RUSTDOCFLAGS="-D warnings" cargo doc --no-deps
 cargo test --all-targets && cargo test --doc   # Linux, macOS, Windows in CI
-cargo +1.89 check --lib                        # MSRV
+cargo +1.97 check --lib                        # MSRV
 cargo llvm-cov --all-targets --fail-under-lines 85 --summary-only
 cargo publish --dry-run
 cargo build --example visits && scripts/smoke-sessions.sh   # real server, sessions

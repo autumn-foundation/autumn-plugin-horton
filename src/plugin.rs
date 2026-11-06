@@ -103,7 +103,7 @@ impl Plugin for HortonPlugin {
         Some(
             PluginContract::new(NAME)
                 .plugin_version(env!("CARGO_PKG_VERSION"))
-                .autumn_web("0.9"),
+                .autumn_web("0.10"),
         )
     }
 
