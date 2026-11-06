@@ -1,4 +1,4 @@
-msrv = "1.89"
+msrv = "1.97"
 allow-expect-in-tests = true
 allow-unwrap-in-tests = true
 allow-panic-in-tests = true
