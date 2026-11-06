@@ -21,6 +21,8 @@ scripts/verify-verus.sh                        # Verus proofs (CI installs Verus
 
 ## Rules the code keeps
 
+- README Rust snippets are doctests. Make them compile; use `no_run`, not `ignore`.
+  `tests/doc_snippets.rs` checks the TOML snippets and the version pins in the docs.
 - No disk I/O on an async task. Only the store thread (`src/engine.rs`)
   touches the `Db`.
 - The store thread replies only after the write is in the WAL.
