@@ -8,10 +8,12 @@ An Autumn 0.11 plugin for the horton key-value store. Read `README.md`
 ```sh
 cargo fmt --all --check
 cargo +stable clippy --all-targets -- -D warnings   # CI uses stable: new lints land there
-RUSTDOCFLAGS="-D warnings" cargo doc --no-deps
-cargo test --all-targets && cargo test --doc   # Linux, macOS, Windows in CI
+cargo +stable clippy --all-targets --features fleet -- -D warnings
+RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --features fleet,autumn-web/sqlite
+cargo test --all-targets --features fleet && cargo test --doc --features fleet   # Linux, macOS, Windows in CI
 cargo +1.97 check --lib                        # MSRV
-cargo llvm-cov --all-targets --fail-under-lines 85 --summary-only
+cargo +1.97 check --lib --features fleet,autumn-web/sqlite
+cargo llvm-cov --all-targets --features fleet --fail-under-lines 85 --summary-only
 cargo publish --dry-run
 cargo build --example visits && scripts/smoke-sessions.sh   # real server, sessions
 scripts/verify-verus.sh                        # Verus proofs (CI installs Verus)
@@ -29,6 +31,9 @@ scripts/verify-verus.sh                        # Verus proofs (CI installs Verus
 - No `unwrap`, `expect` or `panic!` outside tests.
 - `src/ttl.rs`, `src/keys.rs` and `src/group.rs` mirror the Verus specs in
   `verification/`. Change both together.
+- `src/fleet.rs` (feature `fleet`) is the Autumn fleet engine. A fleet
+  database is a directory: `store.horton` and the `identity` stamp file
+  (ADR 0005). A snapshot runs on the store thread (`Request::Snapshot`).
 - `src/device.rs` has `cfg(unix)` and `cfg(windows)` halves. Keep them in
   step.
 - Every new behavior gets a test. Every critical invariant gets a spec.

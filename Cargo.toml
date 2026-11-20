@@ -12,10 +12,17 @@ keywords = ["autumn", "plugin", "key-value", "lsm", "session"]
 categories = ["web-programming", "database-implementations"]
 exclude = [".github/", "CLAUDE.md", "verification/", "docs/plan.md"]
 
+[features]
+# A fleet of horton stores: one store for each tenant or slot.
+fleet = ["autumn-web/db", "dep:axum", "dep:http"]
+
 [dependencies]
 # Lean: the plugin uses only the always-on surfaces (plugin, actuator,
 # session, config, test). The app's own features unify on top.
 autumn-web = { version = "0.11.0", default-features = false }
+# The fleet extractor (feature `fleet`).
+axum = { version = "0.8", default-features = false, optional = true }
+http = { version = "1", optional = true }
 horton = "0.18"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -26,10 +33,14 @@ toml = "1.1"
 tracing = "0.1"
 
 [dev-dependencies]
-autumn-web = { version = "0.11.0", default-features = false, features = ["plugin-conformance"] }
+autumn-web = { version = "0.11.0", default-features = false, features = ["plugin-conformance", "sqlite"] }
 proptest = "1"
 tempfile = "3"
 tokio = { version = "1", features = ["full", "test-util"] }
+
+[package.metadata.docs.rs]
+# `fleet` needs an Autumn database backend. The app selects it.
+features = ["fleet", "autumn-web/sqlite"]
 
 [lints.rust]
 unsafe_code = "forbid"

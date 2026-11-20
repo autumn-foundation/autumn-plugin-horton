@@ -250,6 +250,8 @@ struct Inner {
     tx: Option<mpsc::Sender<Request>>,
     thread: Mutex<Option<JoinHandle<()>>>,
     snapshot: Snapshot,
+    /// Calls that wait for the store thread now.
+    busy: std::sync::atomic::AtomicUsize,
 }
 
 impl Drop for Inner {
@@ -346,6 +348,7 @@ impl Horton {
                 tx: Some(tx),
                 thread: Mutex::new(Some(thread)),
                 snapshot,
+                busy: std::sync::atomic::AtomicUsize::new(0),
             }),
         })
     }
@@ -516,6 +519,54 @@ impl Horton {
         result
     }
 
+    /// Copies the store file to `dest`. The store thread flushes and
+    /// finishes compaction first, so a store with no change since the last
+    /// copy gives the same bytes.
+    #[cfg(feature = "fleet")]
+    pub(crate) async fn copy_to(&self, dest: std::path::PathBuf) -> Result<(), HortonError> {
+        self.call(|reply| Request::Snapshot(dest, reply)).await
+    }
+
+    /// Closes the store from a thread that is not a Tokio worker. It waits
+    /// for the store thread to flush and stop.
+    #[cfg(feature = "fleet")]
+    pub(crate) fn close_blocking(&self) -> Result<(), HortonError> {
+        let close = |sender: &mpsc::Sender<Request>| {
+            let (tx, rx) = oneshot::channel();
+            if sender.blocking_send(Request::Close(tx)).is_err() {
+                Ok(())
+            } else {
+                rx.blocking_recv().unwrap_or(Ok(()))
+            }
+        };
+        // Tokio refuses a blocking send on a runtime thread. A scoped thread
+        // is never a runtime thread.
+        let result = self.inner.tx.as_ref().map_or(Ok(()), |sender| {
+            std::thread::scope(|scope| {
+                scope
+                    .spawn(|| close(sender))
+                    .join()
+                    .unwrap_or(Err(HortonError::Closed))
+            })
+        });
+        let thread = self
+            .inner
+            .thread
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take();
+        if let Some(thread) = thread {
+            let _ = thread.join();
+        }
+        result
+    }
+
+    /// True while a call waits for the store thread.
+    #[cfg(feature = "fleet")]
+    pub(crate) fn is_busy(&self) -> bool {
+        self.inner.busy.load(std::sync::atomic::Ordering::Acquire) > 0
+    }
+
     /// The stats after the last request, with no wait. `None` before the
     /// store thread has answered once.
     #[must_use]
@@ -583,12 +634,29 @@ impl Horton {
         let Some(sender) = &self.inner.tx else {
             return Err(HortonError::Closed);
         };
+        let _busy = Busy::enter(&self.inner.busy);
         let (tx, rx) = oneshot::channel();
         sender
             .send(make(tx))
             .await
             .map_err(|_| HortonError::Closed)?;
         rx.await.map_err(|_| HortonError::Closed)?
+    }
+}
+
+/// Counts one call while it lives. A dropped call future also ends it.
+struct Busy<'a>(&'a std::sync::atomic::AtomicUsize);
+
+impl<'a> Busy<'a> {
+    fn enter(count: &'a std::sync::atomic::AtomicUsize) -> Self {
+        count.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        Self(count)
+    }
+}
+
+impl Drop for Busy<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
     }
 }
 

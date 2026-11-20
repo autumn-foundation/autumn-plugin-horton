@@ -181,6 +181,92 @@ With `sessions = true` the plugin replaces Autumn's `[session] backend`
 - **Clock.** The store clock is in Unix seconds and never goes back, also
   after a restart.
 
+## Fleets
+
+The `fleet` feature gives each tenant (or each slot) its own horton store.
+Autumn core runs the fleet: keys, paths, opens, idle closes, the memory
+budget, slot ownership and fencing. The plugin gives the horton engine and
+the `FleetHorton` extractor. The fleet needs an Autumn database backend:
+turn on the `postgres` or the `sqlite` feature of `autumn-web`.
+
+```toml
+[dependencies]
+autumn-plugin-horton = { version = "0.1", features = ["fleet"] }
+```
+
+```rust,no_run
+# #[cfg(feature = "fleet")]
+# mod example {
+use autumn_plugin_horton::HortonError;
+use autumn_plugin_horton::fleet::{FleetHorton, HortonFleetPlugin};
+use autumn_web::prelude::*;
+
+#[get("/visits")]
+async fn visits(store: FleetHorton) -> AutumnResult<String> {
+    let seen = store
+        .get(b"visits")
+        .await
+        .map_err(HortonError::into_autumn)?
+        .and_then(|bytes| <[u8; 8]>::try_from(bytes.as_slice()).ok())
+        .map_or(0, u64::from_be_bytes);
+    let count = seen + 1;
+    store
+        .put(b"visits", &count.to_be_bytes())
+        .await
+        .map_err(HortonError::into_autumn)?;
+    Ok(count.to_string())
+}
+
+pub async fn run() {
+    autumn_web::app()
+        .plugin(HortonFleetPlugin::new())
+        .routes(routes![visits])
+        .run()
+        .await;
+}
+# }
+# fn main() {}
+```
+
+The plugin reads `[horton_fleet]`. The top keys are the Autumn fleet keys,
+as in `[database.fleet]`. `engine` has the `size_mib` and `sync` keys of
+`[horton]`:
+
+```toml
+[horton_fleet]
+mode = "tenant"                      # one store for each tenant; "slot" gives one for each slot
+root = "data/tenants"
+create_on_demand = true
+max_resident_bytes = 1073741824      # the memory budget of all open stores
+ship_every_secs = 60                 # the interval between two replica generations
+resident_bytes = 16777216            # the memory that one open store counts
+
+[horton_fleet.engine]
+size_mib = 128                       # the size of a new store file (sparse on Linux and macOS)
+sync = true
+
+[horton_fleet.ownership]
+owner = "host-a"
+```
+
+`AUTUMN_HORTON_FLEET__ROOT` and `AUTUMN_HORTON_FLEET__OWNERSHIP__OWNER` set
+`root` and `ownership.owner`.
+
+- A fleet database is a directory with two files: `store.horton` and
+  `identity`. `identity` holds the tenant key and the ownership epoch. A
+  store of another key, or of a newer epoch, does not open.
+- The extractor opens the store of the request tenant. It gives `400` with
+  no tenant and `421` when another host owns the slot. In a job, use
+  `FleetHorton::for_key(&state, tenant)`.
+- A snapshot of an open store runs on the store thread. The thread flushes,
+  finishes compaction, then copies the store file. A store with no write
+  since the last snapshot gives the same bytes, so the fleet ships nothing.
+  All-zero blocks stay holes in the copy.
+- A fleet store never keeps sessions. Use `HortonPlugin` for sessions.
+- The plugin closes idle stores, and all stores at shutdown, in each role.
+- The engine passes the Autumn fleet conformance kit
+  (`autumn_web::plugin_conformance::fleet`).
+
 ## Health and metrics
 
 - `/actuator/health` shows `components.horton`. It is `UP` while the

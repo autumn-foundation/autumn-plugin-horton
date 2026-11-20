@@ -101,6 +101,9 @@ pub enum Request {
     Stats(Reply<Stats>),
     /// Delete expired sessions.
     Sweep(Reply<u64>),
+    /// Flush, compact until nothing is pending, then copy the store file.
+    #[cfg(feature = "fleet")]
+    Snapshot(std::path::PathBuf, Reply<()>),
     /// Flush, release the file and stop.
     Close(Reply<()>),
 }
@@ -298,6 +301,32 @@ impl Engine {
                     self.compaction_stuck = None;
                 }
                 self.reply(reply, r.map_err(Into::into));
+            }
+            #[cfg(feature = "fleet")]
+            Request::Snapshot(dest, reply) => {
+                let r = self
+                    .room
+                    .flush(&mut self.db, purge)
+                    .and_then(|()| {
+                        while self.db.compaction_pending() {
+                            self.room.job(&mut self.db, purge)?;
+                        }
+                        Ok(())
+                    })
+                    .map_err(HortonError::from)
+                    .and_then(|()| {
+                        self.db
+                            .device()
+                            .copy_to(&dest)
+                            .map_err(|e| HortonError::Open {
+                                path: dest.clone(),
+                                reason: e.to_string(),
+                            })
+                    });
+                if r.is_ok() {
+                    self.compaction_stuck = None;
+                }
+                self.reply(reply, r);
             }
             Request::Stats(reply) => self.reply(reply, Ok(self.stats())),
             Request::Sweep(reply) => {
