@@ -179,7 +179,7 @@ async fn a_batch_applies_all_its_ops() {
     b.put(b"a", b"1")
         .put(b"b", b"2")
         .delete(b"gone")
-        .put_with_ttl(b"c", b"3", Duration::from_secs(3600));
+        .put_with_ttl(b"c", b"3", Duration::from_hours(1));
     assert_eq!(b.len(), 4);
     assert!(!b.is_empty());
     db.write(b).await.expect("write");

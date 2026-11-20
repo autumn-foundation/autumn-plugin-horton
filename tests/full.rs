@@ -80,7 +80,7 @@ async fn expired_sessions_are_swept_from_a_full_store() {
     let read = Arc::clone(&now);
     let db = Horton::open_with_clock(&config(&dir), Arc::new(move || read.load(Ordering::SeqCst)))
         .expect("open");
-    let store = HortonSessionStore::new(db.clone(), Duration::from_secs(60));
+    let store = HortonSessionStore::new(db.clone(), Duration::from_mins(1));
     let blob: HashMap<String, String> = [("blob".to_owned(), "x".repeat(3900))].into();
     let mut saved = 0u32;
     loop {
