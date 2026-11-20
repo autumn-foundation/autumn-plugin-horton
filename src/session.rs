@@ -24,7 +24,7 @@ use crate::ttl::ttl_secs;
 const DEFAULT_MAX_AGE: u64 = 86_400;
 
 /// How often the plugin sweeps expired sessions.
-pub const SWEEP_EVERY: Duration = Duration::from_secs(60);
+pub const SWEEP_EVERY: Duration = Duration::from_mins(1);
 
 /// A [`SessionStore`] over a [`Horton`] store.
 ///
@@ -170,7 +170,7 @@ mod tests {
             .with_size_mib(crate::HortonConfig::min_size_mib())
             .with_sync(false);
         let db = Horton::open(&config).expect("open");
-        let store = HortonSessionStore::new(db.clone(), Duration::from_secs(60));
+        let store = HortonSessionStore::new(db.clone(), Duration::from_mins(1));
         let mut batch = Batch::new();
         batch.put(&session_key_bytes(&session_hash("bad")), b"{not json");
         db.write_in(batch, crate::handle::Space::Plugin)

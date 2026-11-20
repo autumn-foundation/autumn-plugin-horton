@@ -34,7 +34,7 @@ fn data(pairs: &[(&str, &str)]) -> HashMap<String, String> {
 async fn save_load_destroy() {
     let dir = tempfile::tempdir().expect("tempdir");
     let db = Horton::open(&config(&dir)).expect("open");
-    let store = HortonSessionStore::new(db.clone(), Duration::from_secs(3600));
+    let store = HortonSessionStore::new(db.clone(), Duration::from_hours(1));
     assert_eq!(store.load("abc").await, Ok(None));
     store
         .save("abc", data(&[("user", "42"), ("role", "admin")]))
@@ -53,7 +53,7 @@ async fn save_load_destroy() {
 async fn sessions_never_show_in_app_scans_or_reads() {
     let dir = tempfile::tempdir().expect("tempdir");
     let db = Horton::open(&config(&dir)).expect("open");
-    let store = HortonSessionStore::new(db.clone(), Duration::from_secs(3600));
+    let store = HortonSessionStore::new(db.clone(), Duration::from_hours(1));
     store.save("s1", data(&[("k", "v")])).await.expect("save");
     db.put(b"app", b"v").await.expect("put");
     let keys: Vec<_> = db
@@ -76,7 +76,7 @@ async fn sessions_never_show_in_app_scans_or_reads() {
 async fn large_sessions_and_bad_save_ids_are_errors() {
     let dir = tempfile::tempdir().expect("tempdir");
     let db = Horton::open(&config(&dir)).expect("open");
-    let store = HortonSessionStore::new(db.clone(), Duration::from_secs(60));
+    let store = HortonSessionStore::new(db.clone(), Duration::from_mins(1));
     assert!(store.save("", data(&[("k", "v")])).await.is_err());
     let big = data(&[("blob", &"x".repeat(5000))]);
     assert!(store.save("big", big).await.is_err());
@@ -130,10 +130,7 @@ fn client(store: HortonSessionStore) -> TestClient {
 async fn autumn_sessions_survive_a_restart() {
     let dir = tempfile::tempdir().expect("tempdir");
     let db = Horton::open(&config(&dir)).expect("open");
-    let app = client(HortonSessionStore::new(
-        db.clone(),
-        Duration::from_secs(3600),
-    ));
+    let app = client(HortonSessionStore::new(db.clone(), Duration::from_hours(1)));
     let first = app.get("/bump").send().await;
     assert_eq!(first.text(), "1");
     let cookie = first
@@ -146,10 +143,7 @@ async fn autumn_sessions_survive_a_restart() {
 
     // A new store over the same file: the old cookie still works.
     let db = Horton::open(&config(&dir)).expect("reopen");
-    let app = client(HortonSessionStore::new(
-        db.clone(),
-        Duration::from_secs(3600),
-    ));
+    let app = client(HortonSessionStore::new(db.clone(), Duration::from_hours(1)));
     let third = app.get("/bump").header("cookie", &cookie).send().await;
     assert_eq!(third.text(), "3");
     db.close().await.expect("close");
@@ -159,7 +153,7 @@ async fn autumn_sessions_survive_a_restart() {
 async fn a_bad_session_cookie_starts_a_new_session() {
     let dir = tempfile::tempdir().expect("tempdir");
     let db = Horton::open(&config(&dir)).expect("open");
-    let store = HortonSessionStore::new(db.clone(), Duration::from_secs(3600));
+    let store = HortonSessionStore::new(db.clone(), Duration::from_hours(1));
     let app = client(store.clone());
     let cookie = SessionConfig::default().cookie_name;
     for id in [String::new(), "x".repeat(200)] {

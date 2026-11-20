@@ -1,6 +1,6 @@
 # autumn-plugin-horton
 
-An Autumn 0.10 plugin for the horton key-value store. Read `README.md`
+An Autumn 0.11 plugin for the horton key-value store. Read `README.md`
 (use), `docs/plan.md` (plan and risks) and `docs/adr/` (decisions).
 
 ## Before you push: what CI runs

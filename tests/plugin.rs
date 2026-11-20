@@ -28,7 +28,7 @@ fn the_contract_names_the_crate_and_autumn_0_9() {
         contract.plugin_version.as_deref(),
         Some(env!("CARGO_PKG_VERSION"))
     );
-    assert_eq!(contract.autumn_web.as_deref(), Some("0.10"));
+    assert_eq!(contract.autumn_web.as_deref(), Some("0.11"));
     assert_eq!(HortonPlugin::new().name(), "autumn-plugin-horton");
 }
 
