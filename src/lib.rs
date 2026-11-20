@@ -9,6 +9,8 @@ pub mod config;
 pub mod device;
 mod engine;
 pub mod error;
+#[cfg(feature = "fleet")]
+pub mod fleet;
 mod group;
 mod handle;
 mod health;

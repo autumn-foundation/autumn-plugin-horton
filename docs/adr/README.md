@@ -6,3 +6,4 @@
 | [0002](0002-no-cache-backend.md) | No cache backend in v0.1 |
 | [0003](0003-key-namespaces.md) | Plugin keys start with byte 0x00 |
 | [0004](0004-store-quota-and-session-sweep.md) | A store quota and a session sweep |
+| [0005](0005-fleet-store-directory.md) | A fleet database is a directory with a stamp file |

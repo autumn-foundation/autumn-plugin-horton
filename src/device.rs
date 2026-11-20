@@ -159,6 +159,53 @@ impl FileDevice {
     }
 }
 
+impl FileDevice {
+    /// Copies the store file to `dest` through this handle. The copy has
+    /// the same size and bytes. All-zero blocks stay holes.
+    ///
+    /// # Errors
+    ///
+    /// The I/O error of a read or a write.
+    pub fn copy_to(&self, dest: &Path) -> io::Result<()> {
+        let len = (self.blocks + 1) * BLOCK as u64;
+        copy_file(&self.file, len, dest)
+    }
+}
+
+/// Copies the closed store file at `from` to `dest`. The copy has the same
+/// size and bytes. All-zero blocks stay holes.
+///
+/// # Errors
+///
+/// The I/O error of a read or a write.
+pub fn copy_closed(from: &Path, dest: &Path) -> io::Result<()> {
+    let file = File::open(from)?;
+    let len = file.metadata()?.len();
+    copy_file(&file, len, dest)
+}
+
+/// Copies `len` bytes of `src` to a new file at `dest`, one block at a time.
+fn copy_file(src: &File, len: u64, dest: &Path) -> io::Result<()> {
+    let mut options = OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+    let out = options.open(dest)?;
+    out.set_len(len)?;
+    let mut buf = vec![0u8; BLOCK];
+    let mut offset = 0;
+    while offset < len {
+        let n = usize::try_from(len - offset).map_or(BLOCK, |rest| rest.min(BLOCK));
+        let chunk = &mut buf[..n];
+        read_at(src, chunk, offset)?;
+        if chunk.iter().any(|b| *b != 0) {
+            write_at(&out, chunk, offset)?;
+        }
+        offset += n as u64;
+    }
+    out.sync_all()
+}
+
 /// Makes a new file's directory entry durable.
 #[cfg(unix)]
 fn sync_parent(path: &Path) -> io::Result<()> {

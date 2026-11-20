@@ -36,7 +36,8 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       # Cargo.toml sets pedantic and nursery; -D warnings makes them errors.
       - run: cargo clippy --locked --all-targets -- -D warnings
-      - run: cargo doc --locked --no-deps
+      - run: cargo clippy --locked --all-targets --features fleet -- -D warnings
+      - run: cargo doc --locked --no-deps --features fleet,autumn-web/sqlite
         env:
           RUSTDOCFLAGS: -D warnings
 
@@ -51,8 +52,8 @@ jobs:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - run: cargo test --locked --all-targets
-      - run: cargo test --locked --doc
+      - run: cargo test --locked --all-targets --features fleet
+      - run: cargo test --locked --doc --features fleet
       - name: sessions survive a restart (real server)
         if: runner.os != 'Windows'
         run: cargo build --locked --example visits && ./scripts/smoke-sessions.sh
@@ -67,6 +68,7 @@ jobs:
           toolchain: "1.97"
       - uses: Swatinem/rust-cache@v2
       - run: cargo +1.97 check --locked --lib
+      - run: cargo +1.97 check --locked --lib --features fleet,autumn-web/sqlite
 
   coverage:
     name: coverage (85 % lines)
@@ -78,7 +80,7 @@ jobs:
           components: llvm-tools-preview
       - uses: taiki-e/install-action@cargo-llvm-cov
       - uses: Swatinem/rust-cache@v2
-      - run: cargo llvm-cov --locked --all-targets --fail-under-lines 85 --summary-only
+      - run: cargo llvm-cov --locked --all-targets --features fleet --fail-under-lines 85 --summary-only
 
   package:
     name: package (cargo publish --dry-run)

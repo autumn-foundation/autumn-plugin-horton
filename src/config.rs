@@ -154,37 +154,8 @@ impl HortonConfig {
     /// - an `AUTUMN_HORTON__*` value does not parse;
     /// - [`validate`](Self::validate) fails.
     pub fn resolve_with_env(self, env: &dyn Env) -> Result<Self, HortonError> {
-        let mut merged = toml::Table::new();
-        merged.insert(
-            SECTION.into(),
-            toml::Value::try_from(&self).map_err(|e| HortonError::Config(e.to_string()))?,
-        );
-        let mut merged = toml::Value::Table(merged);
-        let (selected, canonical) = active_profile(env);
-
-        if let Some(base) = read_toml(&find_file("autumn.toml", env))? {
-            merge(&mut merged, section_only(&base));
-            for name in inline_profile_names(&canonical) {
-                if let Some(profile) = base
-                    .get("profile")
-                    .and_then(|p| p.get(name))
-                    .map(section_only)
-                {
-                    merge(&mut merged, profile);
-                }
-            }
-        }
-        for name in autumn_web::config::profile_override_file_lookup_names(&canonical, &selected) {
-            if let Some(file) = read_toml(&find_file(&format!("autumn-{name}.toml"), env))? {
-                merge(&mut merged, section_only(&file));
-                break;
-            }
-        }
-
-        let section = merged
-            .get(SECTION)
-            .cloned()
-            .unwrap_or_else(|| toml::Value::Table(toml::Table::new()));
+        let base = toml::Value::try_from(&self).map_err(|e| HortonError::Config(e.to_string()))?;
+        let section = layered_section(SECTION, base, env)?;
         let mut config: Self = section
             .try_into()
             .map_err(|e: toml::de::Error| HortonError::Config(e.message().to_owned()))?;
@@ -214,6 +185,45 @@ impl HortonConfig {
 }
 
 /// A non-blank `AUTUMN_HORTON__<field>` value.
+/// The `[section]` table of the app files, merged over `base`.
+///
+/// The layers are `autumn.toml`, its `[profile.<p>.<section>]` tables and
+/// `autumn-<p>.toml`, lowest first.
+pub(crate) fn layered_section(
+    section: &str,
+    base: toml::Value,
+    env: &dyn Env,
+) -> Result<toml::Value, HortonError> {
+    let mut merged = toml::Table::new();
+    merged.insert(section.into(), base);
+    let mut merged = toml::Value::Table(merged);
+    let (selected, canonical) = active_profile(env);
+
+    if let Some(base) = read_toml(&find_file("autumn.toml", env))? {
+        merge(&mut merged, section_only(&base, section));
+        for name in inline_profile_names(&canonical) {
+            if let Some(profile) = base
+                .get("profile")
+                .and_then(|p| p.get(name))
+                .map(|p| section_only(p, section))
+            {
+                merge(&mut merged, profile);
+            }
+        }
+    }
+    for name in autumn_web::config::profile_override_file_lookup_names(&canonical, &selected) {
+        if let Some(file) = read_toml(&find_file(&format!("autumn-{name}.toml"), env))? {
+            merge(&mut merged, section_only(&file, section));
+            break;
+        }
+    }
+
+    Ok(merged
+        .get(section)
+        .cloned()
+        .unwrap_or_else(|| toml::Value::Table(toml::Table::new())))
+}
+
 fn env_value(env: &dyn Env, field: &str) -> Option<String> {
     env.var(&format!("AUTUMN_HORTON__{field}"))
         .ok()
@@ -304,10 +314,10 @@ fn read_toml(path: &Path) -> Result<Option<toml::Value>, HortonError> {
 }
 
 /// Only the `[horton]` table of a document, so other sections never merge.
-fn section_only(doc: &toml::Value) -> toml::Value {
+fn section_only(doc: &toml::Value, name: &str) -> toml::Value {
     let mut out = toml::Table::new();
-    if let Some(section) = doc.get(SECTION) {
-        out.insert(SECTION.into(), section.clone());
+    if let Some(section) = doc.get(name) {
+        out.insert(name.into(), section.clone());
     }
     toml::Value::Table(out)
 }

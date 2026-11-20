@@ -12,6 +12,11 @@ The crate follows [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- The `fleet` feature: one horton store for each tenant or slot, on the
+  Autumn database fleet. `HortonFleetPlugin` reads `[horton_fleet]`, and
+  `FleetHorton` is the extractor. A snapshot is a copy of the store file
+  that the store thread makes after a flush and a full compaction. The
+  engine passes the Autumn fleet conformance kit, with replication.
 - `HortonPlugin`: opens a horton store at startup, puts a `Horton` handle
   in `AppState`, and closes the store at shutdown. It declares
   `autumn_web = "0.8"`.
