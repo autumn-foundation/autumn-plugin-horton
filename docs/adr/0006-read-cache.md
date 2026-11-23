@@ -47,8 +47,10 @@ Autumn API. This one is about the plugin's own read path.
 ## Consequences
 
 - A hit costs one hash lookup and one copy. With 128 callers,
-  `get_cached` in the benchmark serves about 670,000 gets per second and
-  `get_table` (cache off) about 16,500: 40 times more.
+  `get_cached` in the benchmark serves about 816,000 gets per second and
+  `get_table` (cache off) about 15,200: 54 times more. A cache that holds
+  a fifth of the keys (`get_churn`) is not slower than no cache.
+  `docs/performance.md` has the numbers.
 - A hot key with no TTL costs two horton reads, one time; then it hits
   until a write. A key with a TTL that no write touched since open goes
   back to horton once per clock second.

@@ -48,18 +48,44 @@ const fn spread(i: u64) -> u64 {
     i.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 11
 }
 
-/// Opens a store. `cache` turns the read cache on (the default size) or off.
-fn open(dir: &tempfile::TempDir, sync: bool, cache: bool) -> Horton {
+/// The read cache of a benchmark store.
+#[derive(Clone, Copy)]
+enum Cache {
+    /// No read cache: horton answers each get.
+    Off,
+    /// The default size: it holds every key of the benchmark.
+    On,
+    /// 1 MiB: about 4,300 of the 20,000 keys. Most gets miss and evict.
+    Small,
+}
+
+/// Opens a store with the read cache `cache`.
+fn open(dir: &tempfile::TempDir, sync: bool, cache: Cache) -> Horton {
     let config = HortonConfig::default()
         .with_path(dir.path().join("bench.horton"))
         .with_size_mib(256)
         .with_sync(sync);
-    let config = if cache {
-        config
-    } else {
-        config.with_cache_mib(0)
+    let config = match cache {
+        Cache::Off => config.with_cache_mib(0),
+        Cache::On => config,
+        Cache::Small => config.with_cache_mib(1),
     };
     Horton::open(&config).expect("open")
+}
+
+/// Reads every key in two clock seconds. A key that a get reads in two
+/// seconds is hot: the read cache keeps it until a write.
+fn warm(rt: &Runtime, db: &Horton) {
+    rt.block_on(async {
+        for pass in 0..2 {
+            if pass > 0 {
+                tokio::time::sleep(Duration::from_millis(1_100)).await;
+            }
+            for i in 0..KEYS {
+                db.get(&key(i)).await.expect("warm");
+            }
+        }
+    });
 }
 
 /// Loads `KEYS` keys. `compact` moves them from the memtable to tables.
@@ -109,7 +135,7 @@ fn writes(c: &mut Criterion) {
     let rt = runtime();
     for sync in [false, true] {
         let dir = tempfile::tempdir().expect("tempdir");
-        let db = open(&dir, sync, true);
+        let db = open(&dir, sync, Cache::On);
         let mut g = c.benchmark_group(if sync { "put_sync" } else { "put" });
         g.throughput(Throughput::Elements(1));
         for tasks in TASKS {
@@ -129,18 +155,23 @@ fn writes(c: &mut Criterion) {
 fn reads(c: &mut Criterion) {
     let rt = runtime();
     // `get_memtable` and `get_table` turn the read cache off: they measure
-    // horton's read path. `get_cached` reads the same table keys through
-    // the read cache.
+    // horton's read path. `get_cached` reads the same table keys through a
+    // warm read cache (every key hot). `get_churn` reads them through a
+    // read cache that holds a fifth of them: the cost of misses.
     for (name, compact, cache) in [
-        ("get_memtable", false, false),
-        ("get_table", true, false),
-        ("get_cached", true, true),
+        ("get_memtable", false, Cache::Off),
+        ("get_table", true, Cache::Off),
+        ("get_cached", true, Cache::On),
+        ("get_churn", true, Cache::Small),
     ] {
         let dir = tempfile::tempdir().expect("tempdir");
         let db = open(&dir, false, cache);
         // The memtable holds 4096 entries: keep the memtable case inside it.
         if compact {
             load(&rt, &db, true);
+            if matches!(cache, Cache::On) {
+                warm(&rt, &db);
+            }
         } else {
             rt.block_on(async {
                 for i in 0..2_000 {
@@ -169,7 +200,7 @@ fn reads(c: &mut Criterion) {
 fn scans(c: &mut Criterion) {
     let rt = runtime();
     let dir = tempfile::tempdir().expect("tempdir");
-    let db = open(&dir, false, true);
+    let db = open(&dir, false, Cache::On);
     load(&rt, &db, true);
     let mut g = c.benchmark_group("scan_100");
     g.throughput(Throughput::Elements(1));
