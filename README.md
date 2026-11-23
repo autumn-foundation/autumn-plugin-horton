@@ -269,6 +269,14 @@ owner = "host-a"
 - The engine passes the Autumn fleet conformance kit
   (`autumn_web::plugin_conformance::fleet`).
 
+## Performance
+
+One store thread serves every call. A read cache in front of horton
+(`cache_mib`) answers repeat gets from memory. Writes go in group commits:
+one WAL block and one `fdatasync` for many callers. See
+[`docs/performance.md`](docs/performance.md) for the benchmark, the
+numbers and the costs that are left in horton.
+
 ## Health and metrics
 
 - `/actuator/health` shows `components.horton`. It is `UP` while the

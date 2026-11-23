@@ -217,10 +217,17 @@ async fn repeat_gets_hit_the_cache() {
         1,
         Arc::new(move || read.load(Ordering::SeqCst)),
     );
+    // A get makes the entry ("absent"); the write then updates it.
+    assert_eq!(db.get(b"written").await, Ok(None));
     db.put(b"written", b"w").await.expect("put");
     db.flush().await.expect("flush");
     let before = db.stats().await.expect("stats");
-    // Written since open: the write put it in the cache.
+    // A key that no get asked for takes no entry.
+    db.put(b"only-written", b"o").await.expect("put");
+    assert_eq!(
+        db.stats().await.expect("stats").read_cache_entries,
+        before.read_cache_entries
+    );
     for _ in 0..10 {
         assert_eq!(db.get(b"written").await, Ok(Some(b"w".to_vec())));
     }
@@ -264,6 +271,8 @@ async fn a_cached_ttl_value_expires_on_the_store_clock() {
         1,
         Arc::new(move || read.load(Ordering::SeqCst)),
     );
+    // The get makes the entry; the TTL write updates it with its expiry.
+    assert_eq!(db.get(b"k").await, Ok(None));
     db.put_with_ttl(b"k", b"v", Duration::from_secs(2))
         .await
         .expect("put");
@@ -277,8 +286,9 @@ async fn a_cached_ttl_value_expires_on_the_store_clock() {
     db.close().await.expect("close");
 }
 
-/// Sessions read through the cache. A save makes the next load a hit. The
-/// sweep leaves no entry for a dead session behind.
+/// Sessions read through the cache. After the first load, a save updates
+/// the entry, so the next load is a hit. The sweep leaves no entry for a
+/// dead session behind.
 #[tokio::test]
 async fn sessions_hit_the_cache_and_the_sweep_leaves_no_dead_entries() {
     use autumn_plugin_horton::HortonSessionStore;
@@ -297,6 +307,8 @@ async fn sessions_hit_the_cache_and_the_sweep_leaves_no_dead_entries() {
     let store = HortonSessionStore::new(db.clone(), Duration::from_mins(1));
     let data: HashMap<String, String> = [("user".to_owned(), "ada".to_owned())].into();
     for i in 0..20 {
+        // A new session: the first load finds nothing.
+        assert_eq!(store.load(&format!("s{i}")).await, Ok(None));
         store
             .save(&format!("s{i}"), data.clone())
             .await

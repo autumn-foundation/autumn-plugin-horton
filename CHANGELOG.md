@@ -9,7 +9,7 @@ The crate follows [Semantic Versioning](https://semver.org/).
 
 - A read cache on the store thread (`cache_mib`, default 16 MiB; 1 MiB for
   each fleet store; 0 turns it off). A repeat get does not read horton.
-  Writes update the cache. Verus proves the cache rules; a property test
+  Gets add keys; writes update the keys that are in the cache. Verus proves the cache rules; a property test
   checks every get against a store without the cache. See ADR 0006.
 - The store thread serves a get and up to three queued gets, then
   publishes the stats once and replies. Fewer runtime wake-ups.

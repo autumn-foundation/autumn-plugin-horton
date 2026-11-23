@@ -24,7 +24,10 @@ Autumn API. This one is about the plugin's own read path.
   1 MiB for each fleet store). 0 turns it off.
 - A write updates the cache after horton accepts it. A put stores the
   value and the expiry tick that horton got. A delete stores "absent". A
-  range delete removes the range. A failed write clears the cache.
+  write changes only a key that has an entry: only a get adds keys. So
+  keys that the app writes but does not read do not push out the keys it
+  reads, and a write-only load costs one hash lookup per key. A range
+  delete removes the range. A failed write clears the cache.
 - A get on a miss stores horton's answer. horton does not return the
   expiry of a value, so a value from a get holds only for the current
   clock second. "Absent" holds until a write: the store clock never goes
@@ -38,13 +41,17 @@ Autumn API. This one is about the plugin's own read path.
 
 ## Consequences
 
-- A hit costs one hash lookup and one copy. `get_cached` in the benchmark
-  is about 10 times faster than `get_table`.
+- A hit costs one hash lookup and one copy. With 128 callers,
+  `get_cached` in the benchmark serves about 670,000 gets per second and
+  `get_table` (cache off) about 16,500: 40 times more.
 - A key that a get reads but no write touched since open goes back to
   horton once per clock second. A hot key still hits almost always.
-- Writes do a little more work: about 5 % of put throughput with 128
-  callers. The store thread updates the cache after it replies, so the
-  callers do not wait for it.
+- Writes do a little more work: one hash lookup per key. The store thread
+  updates the cache after it replies, so the callers do not wait for it.
+  An earlier design that added every written key cost 5 % of put
+  throughput with 128 callers.
+- The first get of a key after open goes to horton. A session store reads
+  a session before it saves it, so its next load is a hit.
 - Memory use grows by up to `cache_mib`. A fleet counts `resident_bytes`
   for each open store; keep `resident_bytes` above `cache_mib`.
 - A corrupt block that the cache hides is found at the next miss or

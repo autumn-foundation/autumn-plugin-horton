@@ -1,6 +1,6 @@
 //! The read cache.
 //!
-//! The store thread keeps the answers of recent gets and writes in memory.
+//! The store thread keeps the answers of recent gets in memory.
 //! A get that the cache can answer does not read horton. horton checks the
 //! CRC of each 16 KiB block that a get reads, so a table read costs tens of
 //! microseconds. A cache hit costs one map lookup and one copy.
@@ -13,7 +13,10 @@
 //!
 //! - A write updates the entry of each key it writes, after horton accepts
 //!   the write: a put stores the value and its expiry, a delete stores
-//!   "absent". The store clock and session index keys are only forgotten.
+//!   "absent". A write does not add a key that has no entry: only a get
+//!   adds keys. Thus keys that the app writes but never reads do not push
+//!   out the keys it reads. The store clock and session index keys are only
+//!   forgotten.
 //! - A range delete removes the entries in the range. This walks the
 //!   whole cache, but range deletes are rare: the app calls them, and the
 //!   session sweep runs once a minute.
@@ -186,18 +189,18 @@ impl ReadCache {
     /// Stores horton's answer `found` for a get of `key` at clock `now`.
     pub fn fill(&mut self, key: &[u8], found: Option<&[u8]>, now: u64) {
         let valid_until = fill_until(found.is_some(), now);
-        self.set(key, found, 0, valid_until);
+        self.set(key, found, 0, valid_until, true);
     }
 
-    /// Stores a value that a write gave `key`, with expiry tick
-    /// `expire_at` (0: none).
+    /// Updates the entry of `key`, if it has one, to a value that a write
+    /// gave it, with expiry tick `expire_at` (0: none).
     pub fn put(&mut self, key: &[u8], val: &[u8], expire_at: u64) {
-        self.set(key, Some(val), expire_at, u64::MAX);
+        self.set(key, Some(val), expire_at, u64::MAX, false);
     }
 
-    /// Stores "absent" for a key that a write deleted.
+    /// Updates the entry of `key`, if it has one, to "absent".
     pub fn delete(&mut self, key: &[u8]) {
-        self.set(key, None, 0, u64::MAX);
+        self.set(key, None, 0, u64::MAX, false);
     }
 
     /// Removes the entry of `key`.
@@ -241,8 +244,10 @@ impl ReadCache {
         }
     }
 
-    fn set(&mut self, key: &[u8], val: Option<&[u8]>, expire_at: u64, valid_until: u64) {
-        if self.budget == 0 {
+    /// Stores an entry for `key`. With `add == false`, only a key that has
+    /// an entry changes.
+    fn set(&mut self, key: &[u8], val: Option<&[u8]>, expire_at: u64, valid_until: u64, add: bool) {
+        if self.budget == 0 || (!add && self.map.is_empty()) {
             return;
         }
         let cost = key.len() + val.map_or(0, <[u8]>::len) + ENTRY_OVERHEAD;
@@ -261,6 +266,8 @@ impl ReadCache {
             e.expire_at = expire_at;
             e.valid_until = valid_until;
             self.bytes = self.bytes - old + cost;
+        } else if !add {
+            return;
         } else {
             let key: Rc<[u8]> = Rc::from(key);
             let generation = self.next_generation;
@@ -363,6 +370,9 @@ mod tests {
     #[test]
     fn writes_update_and_ranges_remove() {
         let mut c = ReadCache::new(1 << 20);
+        for k in [b"a", b"b", b"c"] {
+            c.fill(k, None, 0);
+        }
         c.put(b"a", b"1", 0);
         c.put(b"b", b"2", 10);
         c.put(b"c", b"3", 0);
@@ -392,7 +402,7 @@ mod tests {
     #[test]
     fn an_entry_larger_than_the_budget_is_not_kept() {
         let mut c = ReadCache::new(ENTRY_OVERHEAD + 4);
-        c.put(b"k", b"ab", 0);
+        c.fill(b"k", Some(b"ab"), 0);
         assert_eq!(c.counts().entries, 1);
         c.put(b"k", b"abcdefgh", 0);
         assert_eq!(c.lookup(b"k", 0), Lookup::Miss, "the old value is gone too");
@@ -404,11 +414,11 @@ mod tests {
         let per = 2 + 8 + ENTRY_OVERHEAD;
         let mut c = ReadCache::new(per * 4);
         for k in [b"k0", b"k1", b"k2", b"k3"] {
-            c.put(k, &[0; 8], 0);
+            c.fill(k, Some(&[0; 8]), 0);
         }
         // k0 is used, so it gets a second chance; k1 goes first.
         assert_ne!(c.lookup(b"k0", 0), Lookup::Miss);
-        c.put(b"k4", &[0; 8], 0);
+        c.fill(b"k4", Some(&[0; 8]), 0);
         assert!(c.counts().bytes <= (per * 4) as u64);
         assert_eq!(c.lookup(b"k1", 0), Lookup::Miss);
         assert_ne!(c.lookup(b"k0", 0), Lookup::Miss);
@@ -416,11 +426,26 @@ mod tests {
     }
 
     #[test]
+    fn a_write_updates_only_a_key_that_has_an_entry() {
+        let mut c = ReadCache::new(1 << 20);
+        c.put(b"new", b"v", 0);
+        c.delete(b"gone");
+        assert_eq!(c.counts().entries, 0, "writes add no key");
+        c.fill(b"k", None, 0);
+        c.put(b"k", b"v", 0);
+        assert_eq!(c.lookup(b"k", 0), Lookup::Hit(Some(b"v".to_vec())));
+        c.put(b"other", b"v", 0);
+        assert_eq!(c.counts().entries, 1);
+        c.delete(b"k");
+        assert_eq!(c.lookup(b"k", 0), Lookup::Hit(None));
+    }
+
+    #[test]
     fn churn_keeps_the_queue_small() {
         let mut c = ReadCache::new(1 << 20);
         for i in 0..10_000u32 {
             let k = (i % 8).to_be_bytes();
-            c.put(&k, b"v", 0);
+            c.fill(&k, Some(b"v"), 0);
             c.forget(&k);
         }
         assert!(c.queue.len() <= 64 + 2 * c.map.len() + 1);
