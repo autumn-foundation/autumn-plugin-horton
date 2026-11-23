@@ -288,11 +288,19 @@ async fn sessions_hit_the_cache_and_the_sweep_leaves_no_dead_entries() {
     let dir = tempfile::tempdir().expect("tempdir");
     let now = Arc::new(AtomicU64::new(1_000));
     let read = Arc::clone(&now);
-    let db = open(&dir, "sess.horton", 1, Arc::new(move || read.load(Ordering::SeqCst)));
+    let db = open(
+        &dir,
+        "sess.horton",
+        1,
+        Arc::new(move || read.load(Ordering::SeqCst)),
+    );
     let store = HortonSessionStore::new(db.clone(), Duration::from_mins(1));
     let data: HashMap<String, String> = [("user".to_owned(), "ada".to_owned())].into();
     for i in 0..20 {
-        store.save(&format!("s{i}"), data.clone()).await.expect("save");
+        store
+            .save(&format!("s{i}"), data.clone())
+            .await
+            .expect("save");
     }
     let before = db.stats().await.expect("stats");
     for i in 0..20 {
