@@ -229,6 +229,14 @@ pub struct Stats {
     pub cache_hits: u64,
     /// Block reads that went to the file.
     pub cache_misses: u64,
+    /// Gets that the read cache answered.
+    pub read_cache_hits: u64,
+    /// Gets that went to horton.
+    pub read_cache_misses: u64,
+    /// Entries in the read cache.
+    pub read_cache_entries: u64,
+    /// Bytes the read cache holds, by its own count.
+    pub read_cache_bytes: u64,
     /// Group commits.
     pub groups: u64,
     /// Caller writes in those groups.
@@ -322,6 +330,7 @@ impl Horton {
                 "the horton store file keeps the size it was created with"
             );
         }
+        let cache_bytes = config.cache_bytes();
         let (tx, mut rx) = mpsc::channel(QUEUE);
         let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
         let snapshot = Snapshot::default();
@@ -329,15 +338,17 @@ impl Horton {
         let thread = std::thread::Builder::new()
             .name("horton-store".into())
             .stack_size(STACK)
-            .spawn(move || match Engine::open(device, clock, engine_snapshot) {
-                Ok(engine) => {
-                    let _ = ready_tx.send(Ok(()));
-                    engine.run(&mut rx);
-                }
-                Err(e) => {
-                    let _ = ready_tx.send(Err(e));
-                }
-            })
+            .spawn(
+                move || match Engine::open(device, clock, engine_snapshot, cache_bytes) {
+                    Ok(engine) => {
+                        let _ = ready_tx.send(Ok(()));
+                        engine.run(&mut rx);
+                    }
+                    Err(e) => {
+                        let _ = ready_tx.send(Err(e));
+                    }
+                },
+            )
             .map_err(|e| HortonError::Open {
                 path: config.path.clone(),
                 reason: e.to_string(),

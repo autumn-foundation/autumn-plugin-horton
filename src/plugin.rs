@@ -77,6 +77,12 @@ impl HortonPlugin {
         self
     }
 
+    /// Sets the read cache size, in MiB. 0 turns the cache off.
+    pub const fn cache_mib(mut self, cache_mib: u64) -> Self {
+        self.config.cache_mib = cache_mib;
+        self
+    }
+
     /// Uses `config` with no change. The plugin then reads no file and no
     /// environment variable.
     pub fn fixed_config(mut self, config: HortonConfig) -> Self {

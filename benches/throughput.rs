@@ -48,11 +48,17 @@ const fn spread(i: u64) -> u64 {
     i.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 11
 }
 
-fn open(dir: &tempfile::TempDir, sync: bool) -> Horton {
+/// Opens a store. `cache` turns the read cache on (the default size) or off.
+fn open(dir: &tempfile::TempDir, sync: bool, cache: bool) -> Horton {
     let config = HortonConfig::default()
         .with_path(dir.path().join("bench.horton"))
         .with_size_mib(256)
         .with_sync(sync);
+    let config = if cache {
+        config
+    } else {
+        config.with_cache_mib(0)
+    };
     Horton::open(&config).expect("open")
 }
 
@@ -103,7 +109,7 @@ fn writes(c: &mut Criterion) {
     let rt = runtime();
     for sync in [false, true] {
         let dir = tempfile::tempdir().expect("tempdir");
-        let db = open(&dir, sync);
+        let db = open(&dir, sync, true);
         let mut g = c.benchmark_group(if sync { "put_sync" } else { "put" });
         g.throughput(Throughput::Elements(1));
         for tasks in TASKS {
@@ -122,9 +128,16 @@ fn writes(c: &mut Criterion) {
 
 fn reads(c: &mut Criterion) {
     let rt = runtime();
-    for (name, compact) in [("get_memtable", false), ("get_table", true)] {
+    // `get_memtable` and `get_table` turn the read cache off: they measure
+    // horton's read path. `get_cached` reads the same table keys through
+    // the read cache.
+    for (name, compact, cache) in [
+        ("get_memtable", false, false),
+        ("get_table", true, false),
+        ("get_cached", true, true),
+    ] {
         let dir = tempfile::tempdir().expect("tempdir");
-        let db = open(&dir, false);
+        let db = open(&dir, false, cache);
         // The memtable holds 4096 entries: keep the memtable case inside it.
         if compact {
             load(&rt, &db, true);
@@ -156,7 +169,7 @@ fn reads(c: &mut Criterion) {
 fn scans(c: &mut Criterion) {
     let rt = runtime();
     let dir = tempfile::tempdir().expect("tempdir");
-    let db = open(&dir, false);
+    let db = open(&dir, false, true);
     load(&rt, &db, true);
     let mut g = c.benchmark_group("scan_100");
     g.throughput(Throughput::Elements(1));

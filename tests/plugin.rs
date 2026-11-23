@@ -144,9 +144,14 @@ async fn the_builder_path_resolves_files_and_env() {
     let plugin = HortonPlugin::new()
         .path(&path)
         .size_mib(HortonConfig::min_size_mib())
-        .sync(false);
+        .sync(false)
+        .cache_mib(0);
     let app = TestApp::new().plugin(plugin).build();
     let db = app.state().extension::<Horton>().expect("handle");
     assert!(path.exists());
+    db.put(b"k", b"v").await.expect("put");
+    assert_eq!(db.get(b"k").await, Ok(Some(b"v".to_vec())));
+    let stats = db.stats().await.expect("stats");
+    assert_eq!(stats.read_cache_hits, 0, "cache_mib(0) turns the cache off");
     db.close().await.expect("close");
 }

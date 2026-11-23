@@ -17,6 +17,7 @@ mod health;
 pub mod keys;
 mod metrics;
 mod plugin;
+mod read_cache;
 mod session;
 mod shape;
 mod slot;

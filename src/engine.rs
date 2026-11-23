@@ -18,6 +18,8 @@
 //! - **Short poll.** An idle thread polls the channel for 50 µs before it
 //!   sleeps (not on a one-CPU machine). A caller that sends again at once
 //!   does not wait for a thread wake-up.
+//! - **Read cache.** A bounded map of recent answers sits in front of
+//!   horton (`read_cache`). Writes update it after horton accepts them.
 //! - **Clock.** Each request (or read batch) reads the clock once. The store clock is
 //!   `max(last, wall)`, so it never goes back. Each write group also
 //!   writes the clock to the store, and open starts from that value. Thus
@@ -39,6 +41,7 @@ use crate::error::{DbError, HortonError};
 use crate::group;
 use crate::handle::{Batch, BatchOp, Clock, Stats};
 use crate::keys;
+use crate::read_cache::{Lookup, ReadCache};
 use crate::shape::{
     BLOCK, KEY_MAX, ShapeCompaction, ShapeDb, ShapeRevScan, ShapeScan, VAL_MAX, block_on,
 };
@@ -149,6 +152,8 @@ pub struct Engine {
     reads: Vec<GetDone>,
     /// How long the idle thread polls before it sleeps.
     spin: std::time::Duration,
+    /// Recent answers, in front of horton.
+    cache: ReadCache,
 }
 
 /// The latest [`Stats`], shared with every handle.
@@ -165,7 +170,12 @@ impl Engine {
         clippy::large_stack_frames,
         reason = "the database is built on the stack before it is boxed; the store thread has a 64 MiB stack"
     )]
-    pub fn open(device: FileDevice, clock: Clock, snapshot: Snapshot) -> Result<Self, HortonError> {
+    pub fn open(
+        device: FileDevice,
+        clock: Clock,
+        snapshot: Snapshot,
+        cache_bytes: usize,
+    ) -> Result<Self, HortonError> {
         let blocks = device.blocks();
         let min = ShapeDb::<FileDevice>::MIN_DEVICE_BLOCKS;
         if blocks < min {
@@ -199,6 +209,7 @@ impl Engine {
             val: Box::new([0u8; VAL_MAX]),
             reads: Vec::with_capacity(READ_BATCH),
             spin: spin_time(),
+            cache: ReadCache::new(cache_bytes),
         };
         engine.publish();
         Ok(engine)
@@ -293,9 +304,7 @@ impl Engine {
         match req {
             Request::Write(batch, reply) => self.write_group(batch, reply, rx),
             Request::DeleteRange(start, end, reply) => {
-                let r = self.room.with_room(&mut self.db, purge, |db| {
-                    block_on(db.delete_range(&start, &end)).map(drop)
-                });
+                let r = self.delete_range(&start, &end);
                 self.reply(reply, r.map_err(Into::into));
             }
             Request::Get(key, reply) => self.read_batch(&key, reply, rx),
@@ -401,10 +410,35 @@ impl Engine {
         self.reads = reads;
     }
 
-    /// The live value of `key` at the store clock.
+    /// The live value of `key` at the store clock. The read cache answers
+    /// when it can; else horton answers and the cache keeps the answer.
     fn get(&mut self, key: &[u8]) -> Result<Option<Vec<u8>>, DbError> {
+        if let Lookup::Hit(hit) = self.cache.lookup(key, self.now) {
+            return Ok(hit);
+        }
+        let found = self.read_db(key)?;
+        self.cache.fill(key, found.as_deref(), self.now);
+        Ok(found)
+    }
+
+    /// The live value of `key` from horton. The cache does not see it.
+    fn read_db(&mut self, key: &[u8]) -> Result<Option<Vec<u8>>, DbError> {
         let buf = &mut *self.val;
         block_on(self.db.get_with_time(key, buf, self.now)).map(|n| n.map(|n| buf[..n].to_vec()))
+    }
+
+    /// Deletes `[start, end)` in horton, then in the read cache. A failure
+    /// clears the cache: horton may hold the delete or not.
+    fn delete_range(&mut self, start: &[u8], end: &[u8]) -> Result<(), DbError> {
+        let purge = self.purge();
+        let r = self.room.with_room(&mut self.db, purge, |db| {
+            block_on(db.delete_range(start, end)).map(drop)
+        });
+        match r {
+            Ok(()) => self.cache.remove_range(start, end),
+            Err(_) => self.cache.clear(),
+        }
+        r
     }
 
     /// True while free table slots are above the reserve.
@@ -429,7 +463,8 @@ impl Engine {
         }
         let mut bytes = first.wal_bytes();
         let mut ops = first.horton_ops();
-        let mut group = vec![(first, reply)];
+        let mut group = vec![first];
+        let mut replies = vec![reply];
         while let Ok(next) = rx.try_recv() {
             match next {
                 Request::Write(b, r) if self.over_quota(&b).is_some() => {
@@ -450,7 +485,8 @@ impl Engine {
                 {
                     bytes += b.wal_bytes();
                     ops += b.horton_ops();
-                    group.push((b, r));
+                    group.push(b);
+                    replies.push(r);
                 }
                 other => {
                     self.held = Some(other);
@@ -458,19 +494,39 @@ impl Engine {
                 }
             }
         }
-        let result = self.commit(group.iter().flat_map(|(b, _)| b.ops()));
+        let all = || group.iter().flat_map(Batch::ops);
+        let result = self.write_ops(all());
         self.groups += 1;
         self.grouped_writes += group.len() as u64;
+        let ok = result.is_ok();
         let result: Result<(), HortonError> = result.map_err(Into::into);
         self.publish();
-        for (_, reply) in group {
+        for reply in replies {
             let _ = reply.send(result.clone());
+        }
+        // After the replies, so callers do not wait for it. The thread
+        // reads no request before the cache is up to date.
+        if ok {
+            self.cache_writes(all(), self.now);
         }
     }
 
+    /// Writes `ops` and the store clock as one atomic batch, then updates
+    /// the read cache.
+    fn commit<'a>(
+        &mut self,
+        ops: impl Iterator<Item = &'a BatchOp> + Clone,
+    ) -> Result<(), DbError> {
+        self.write_ops(ops.clone())?;
+        self.cache_writes(ops, self.now);
+        Ok(())
+    }
+
     /// Writes `ops` and the store clock as one atomic batch. The caller
-    /// keeps the ops within [`MAX_BATCH_BYTES`] and `GROUP_OPS - 1`.
-    fn commit<'a>(&mut self, ops: impl Iterator<Item = &'a BatchOp>) -> Result<(), DbError> {
+    /// keeps the ops within [`MAX_BATCH_BYTES`] and `GROUP_OPS - 1`, and
+    /// then gives the same ops to [`cache_writes`](Self::cache_writes).
+    /// A failure clears the read cache.
+    fn write_ops<'a>(&mut self, ops: impl Iterator<Item = &'a BatchOp>) -> Result<(), DbError> {
         let now = self.now;
         self.batch.clear();
         for op in ops {
@@ -500,13 +556,36 @@ impl Engine {
         }
         let purge = self.purge();
         let batch = &*self.batch;
-        self.room.with_room(&mut self.db, purge, |db| {
+        let written = self.room.with_room(&mut self.db, purge, |db| {
             block_on(db.write(batch)).map(drop)
-        })?;
+        });
+        if let Err(e) = written {
+            // horton may hold the batch or not: forget everything.
+            self.cache.clear();
+            return Err(e);
+        }
         if clock_moves {
             self.durable_clock = now;
+            self.cache.forget(keys::CLOCK_KEY);
         }
         Ok(())
+    }
+
+    /// Applies committed `ops` to the read cache. The expiry ticks are the
+    /// ones [`write_ops`](Self::write_ops) gave horton at clock `now`.
+    fn cache_writes<'a>(&mut self, ops: impl Iterator<Item = &'a BatchOp>, now: u64) {
+        for op in ops {
+            match op {
+                BatchOp::Put(k, v) => self.cache.put(k, v, 0),
+                BatchOp::PutTtl(k, v, secs) => self.cache.put(k, v, ttl::deadline(now, *secs)),
+                BatchOp::Delete(k) => self.cache.delete(k),
+                BatchOp::SessionPut { key, id, val, secs } => {
+                    let expire = ttl::deadline(now, *secs);
+                    self.cache.put(key, val, expire);
+                    self.cache.forget(&keys::session_index_key(expire, id));
+                }
+            }
+        }
     }
 
     /// Deletes every session whose index entry expired at or before `now`,
@@ -523,14 +602,21 @@ impl Engine {
                     continue;
                 };
                 let key = keys::session_key_bytes(id);
-                // A later save moved the expiry: the session is live.
-                if self.get(&key)?.is_none() {
+                // A later save moved the expiry: the session is live. This
+                // reads horton, so dead sessions do not fill the cache.
+                if self.read_db(&key)?.is_none() {
                     deletes.push(BatchOp::Delete(key));
                 }
             }
             for chunk in deletes.chunks(SWEEP_PAGE / 4) {
                 self.commit(chunk.iter())?;
                 swept += chunk.len() as u64;
+                // No get wants a dead session: drop its "absent" entry.
+                for op in chunk {
+                    if let BatchOp::Delete(key) = op {
+                        self.cache.forget(key);
+                    }
+                }
             }
             match page.last() {
                 Some((last, _)) if page.len() == SWEEP_PAGE => {
@@ -540,11 +626,7 @@ impl Engine {
                 _ => break,
             }
         }
-        let start = keys::SESSION_INDEX;
-        let purge = self.purge();
-        self.room.with_room(&mut self.db, purge, |db| {
-            block_on(db.delete_range(start, &end)).map(drop)
-        })?;
+        self.delete_range(keys::SESSION_INDEX, &end)?;
         Ok(swept)
     }
 
@@ -609,6 +691,10 @@ impl Engine {
             io: crate::device::IoStats::default(),
             cache_hits: 0,
             cache_misses: 0,
+            read_cache_hits: 0,
+            read_cache_misses: 0,
+            read_cache_entries: 0,
+            read_cache_bytes: 0,
             groups: 0,
             grouped_writes: 0,
             flushes: 0,
@@ -638,6 +724,11 @@ impl Engine {
         stats.io = self.db.device().stats();
         stats.cache_hits = cache.hits;
         stats.cache_misses = cache.misses;
+        let read = self.cache.counts();
+        stats.read_cache_hits = read.hits;
+        stats.read_cache_misses = read.misses;
+        stats.read_cache_entries = read.entries;
+        stats.read_cache_bytes = read.bytes;
         stats.groups = self.groups;
         stats.grouped_writes = self.grouped_writes;
         stats.flushes = self.room.flushes;
@@ -771,6 +862,7 @@ mod tests {
             device,
             Arc::new(move || read.load(Ordering::SeqCst)),
             Snapshot::default(),
+            1 << 20,
         )
         .expect("engine")
     }
