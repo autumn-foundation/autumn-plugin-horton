@@ -30,6 +30,33 @@ fn defaults() {
     assert_eq!(c.size_mib, 256);
     assert!(c.sync);
     assert!(!c.sessions);
+    assert_eq!(c.cache_mib, 16);
+    assert_eq!(c.cache_bytes(), 16 << 20);
+    assert_eq!(c.with_cache_mib(u64::MAX).cache_bytes(), usize::MAX);
+}
+
+#[test]
+fn the_cache_size_comes_from_the_file_and_the_env() {
+    let (_dir, env) = project(&[(
+        "autumn.toml",
+        "[horton]
+cache_mib = 64
+",
+    )]);
+    let c = HortonConfig::default()
+        .resolve_with_env(&env)
+        .expect("resolve");
+    assert_eq!(c.cache_mib, 64);
+    let off = HortonConfig::default()
+        .resolve_with_env(&env.with("AUTUMN_HORTON__CACHE_MIB", "0"))
+        .expect("env");
+    assert_eq!(off.cache_mib, 0);
+    let (_dir, env) = project(&[]);
+    assert!(
+        HortonConfig::default()
+            .resolve_with_env(&env.with("AUTUMN_HORTON__CACHE_MIB", "lots"))
+            .is_err()
+    );
 }
 
 #[test]

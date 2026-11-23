@@ -12,7 +12,17 @@
 //! - **Background compaction.** While a job is pending, the thread runs
 //!   one step between requests. When the channel is empty, it runs steps
 //!   continuously.
-//! - **Clock.** Each request reads the clock once. The store clock is
+//! - **Read batches.** The thread takes a get and up to three queued gets
+//!   after it. It serves them, publishes the stats once, then sends the
+//!   replies. A burst of replies wakes fewer runtime threads.
+//! - **Short poll.** An idle thread polls the channel for 50 µs before it
+//!   sleeps. A caller that sends again at once does not wait for a thread
+//!   wake-up. At most half the CPUs poll at the same time, over all the
+//!   stores of the process (a fleet opens many); with one CPU, no thread
+//!   polls.
+//! - **Read cache.** A bounded map of recent answers sits in front of
+//!   horton (`read_cache`). Writes update it after horton accepts them.
+//! - **Clock.** Each request (or read batch) reads the clock once. The store clock is
 //!   `max(last, wall)`, so it never goes back. Each write group also
 //!   writes the clock to the store, and open starts from that value. Thus
 //!   the clock does not go back after a restart either. Compaction purges
@@ -33,6 +43,7 @@ use crate::error::{DbError, HortonError};
 use crate::group;
 use crate::handle::{Batch, BatchOp, Clock, Stats};
 use crate::keys;
+use crate::read_cache::{FAR, Lookup, ReadCache};
 use crate::shape::{
     BLOCK, KEY_MAX, ShapeCompaction, ShapeDb, ShapeRevScan, ShapeScan, VAL_MAX, block_on,
 };
@@ -57,6 +68,15 @@ pub const RESERVE_SLOTS: u32 = 6;
 
 /// Index entries one sweep pass reads.
 const SWEEP_PAGE: usize = 256;
+
+/// The most gets one read batch serves before it replies. A small batch
+/// cuts the wake-ups. A large batch holds early replies too long: the
+/// callers stop while they wait. `benches/throughput.rs` measured 4 as
+/// the best value for 16 and 128 callers.
+const READ_BATCH: usize = 4;
+
+/// A get reply and its result, held until the batch replies.
+type GetDone = (Reply<Option<Vec<u8>>>, Result<Option<Vec<u8>>, HortonError>);
 
 /// One WAL block of ops.
 type GroupBatch = WriteBatch<KEY_MAX, VAL_MAX, GROUP_OPS>;
@@ -128,6 +148,14 @@ pub struct Engine {
     durable_clock: u64,
     /// The last stats, for callers that cannot wait (metrics).
     snapshot: Snapshot,
+    /// Scratch for one value. A get copies only the value bytes out.
+    val: Box<[u8; VAL_MAX]>,
+    /// The gets of the current read batch. The allocation stays.
+    reads: Vec<GetDone>,
+    /// How the idle thread polls before it sleeps.
+    spin: Spin,
+    /// Recent answers, in front of horton.
+    cache: ReadCache,
 }
 
 /// The latest [`Stats`], shared with every handle.
@@ -144,7 +172,12 @@ impl Engine {
         clippy::large_stack_frames,
         reason = "the database is built on the stack before it is boxed; the store thread has a 64 MiB stack"
     )]
-    pub fn open(device: FileDevice, clock: Clock, snapshot: Snapshot) -> Result<Self, HortonError> {
+    pub fn open(
+        device: FileDevice,
+        clock: Clock,
+        snapshot: Snapshot,
+        cache_bytes: usize,
+    ) -> Result<Self, HortonError> {
         let blocks = device.blocks();
         let min = ShapeDb::<FileDevice>::MIN_DEVICE_BLOCKS;
         if blocks < min {
@@ -175,6 +208,10 @@ impl Engine {
             now,
             durable_clock,
             snapshot,
+            val: Box::new([0u8; VAL_MAX]),
+            reads: Vec::with_capacity(READ_BATCH),
+            spin: spin_time(),
+            cache: ReadCache::new(cache_bytes),
         };
         engine.publish();
         Ok(engine)
@@ -193,13 +230,17 @@ impl Engine {
         ttl::purge_limit(self.now, self.durable_clock)
     }
 
-    /// Shares the current stats with the handles.
+    /// Shares the current stats with the handles. It updates the shared
+    /// copy in place, so it does not allocate.
     fn publish(&self) {
-        let stats = self.stats();
-        *self
+        let mut shared = self
             .snapshot
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(stats);
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match &mut *shared {
+            Some(stats) => self.stats_into(stats),
+            None => *shared = Some(self.stats()),
+        }
     }
 
     /// Serves requests until `Close` or until every sender is gone.
@@ -218,7 +259,7 @@ impl Engine {
                     Err(mpsc::error::TryRecvError::Disconnected) => return,
                 }
             } else {
-                match rx.blocking_recv() {
+                match recv(rx, self.spin) {
                     Some(r) => r,
                     None => return,
                 }
@@ -234,10 +275,12 @@ impl Engine {
             }
             self.tick();
             self.serve(req, rx);
+            // Each reply published the stats before it went out. Only a
+            // background step changes them again.
             if self.background_pending() {
                 self.background_step();
+                self.publish();
             }
-            self.publish();
         }
     }
 
@@ -263,15 +306,10 @@ impl Engine {
         match req {
             Request::Write(batch, reply) => self.write_group(batch, reply, rx),
             Request::DeleteRange(start, end, reply) => {
-                let r = self.room.with_room(&mut self.db, purge, |db| {
-                    block_on(db.delete_range(&start, &end)).map(drop)
-                });
+                let r = self.delete_range(&start, &end);
                 self.reply(reply, r.map_err(Into::into));
             }
-            Request::Get(key, reply) => {
-                let r = self.get(&key);
-                self.reply(reply, r.map_err(Into::into));
-            }
+            Request::Get(key, reply) => self.read_batch(&key, reply, rx),
             Request::Scan {
                 start,
                 end,
@@ -338,15 +376,85 @@ impl Engine {
         }
     }
 
-    /// The live value of `key` at the store clock.
-    fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>, DbError> {
-        let mut buf = vec![0u8; VAL_MAX];
-        block_on(self.db.get_with_time(key, &mut buf, self.now)).map(|n| {
-            n.map(|n| {
-                buf.truncate(n);
-                buf
-            })
-        })
+    /// Serves `first` and every get queued after it, up to
+    /// [`READ_BATCH`]. Then it publishes the stats once and sends every
+    /// reply. Another request ends the batch and waits in `held`.
+    fn read_batch(
+        &mut self,
+        first: &[u8],
+        reply: Reply<Option<Vec<u8>>>,
+        rx: &mut mpsc::Receiver<Request>,
+    ) {
+        let mut reads = std::mem::take(&mut self.reads);
+        let r = self.get(first).map_err(Into::into);
+        reads.push((reply, r));
+        while reads.len() < READ_BATCH {
+            match rx.try_recv() {
+                Ok(Request::Get(key, reply)) => {
+                    let r = self.get(&key).map_err(Into::into);
+                    reads.push((reply, r));
+                }
+                Ok(other) => {
+                    self.held = Some(other);
+                    break;
+                }
+                Err(_) => break,
+            }
+        }
+        self.publish();
+        #[allow(
+            clippy::iter_with_drain,
+            reason = "drain keeps the allocation for the next batch"
+        )]
+        for (reply, r) in reads.drain(..) {
+            let _ = reply.send(r);
+        }
+        self.reads = reads;
+    }
+
+    /// The live value of `key` at the store clock. The read cache answers
+    /// when it can; else horton answers and the cache keeps the answer.
+    ///
+    /// A value from horton holds for the current clock second only,
+    /// because horton does not return its expiry. When a key misses again
+    /// after that second (`Lookup::Stale`), the key is hot: the thread
+    /// also reads it at [`FAR`]. A value that is live there has no expiry
+    /// that a clock can reach, so its entry holds until a write.
+    fn get(&mut self, key: &[u8]) -> Result<Option<Vec<u8>>, DbError> {
+        let stale = match self.cache.lookup(key, self.now) {
+            Lookup::Hit(hit) => return Ok(hit),
+            Lookup::Miss => false,
+            Lookup::Stale => true,
+        };
+        let found = self.read_db(key)?;
+        let lasting = stale && found.is_some() && self.live_at(key, FAR)?;
+        self.cache.fill(key, found.as_deref(), self.now, lasting);
+        Ok(found)
+    }
+
+    /// The live value of `key` from horton. The cache does not see it.
+    fn read_db(&mut self, key: &[u8]) -> Result<Option<Vec<u8>>, DbError> {
+        let buf = &mut *self.val;
+        block_on(self.db.get_with_time(key, buf, self.now)).map(|n| n.map(|n| buf[..n].to_vec()))
+    }
+
+    /// True when horton has a value for `key` that is live at clock `t`.
+    fn live_at(&mut self, key: &[u8], t: u64) -> Result<bool, DbError> {
+        block_on(self.db.get_with_time(key, &mut *self.val, t)).map(|n| n.is_some())
+    }
+
+    /// Deletes `[start, end)` in horton, then in the read cache. A failure
+    /// clears the cache: horton may hold the delete or not.
+    fn delete_range(&mut self, start: &[u8], end: &[u8]) -> Result<(), DbError> {
+        let purge = self.purge();
+        let r = self.room.with_room(&mut self.db, purge, |db| {
+            block_on(db.delete_range(start, end)).map(drop)
+        });
+        match r {
+            Ok(()) => self.cache.remove_range(start, end),
+            Err(_) => self.cache.clear(),
+        }
+        r
     }
 
     /// True while free table slots are above the reserve.
@@ -371,7 +479,8 @@ impl Engine {
         }
         let mut bytes = first.wal_bytes();
         let mut ops = first.horton_ops();
-        let mut group = vec![(first, reply)];
+        let mut group = vec![first];
+        let mut replies = vec![reply];
         while let Ok(next) = rx.try_recv() {
             match next {
                 Request::Write(b, r) if self.over_quota(&b).is_some() => {
@@ -392,7 +501,8 @@ impl Engine {
                 {
                     bytes += b.wal_bytes();
                     ops += b.horton_ops();
-                    group.push((b, r));
+                    group.push(b);
+                    replies.push(r);
                 }
                 other => {
                     self.held = Some(other);
@@ -400,19 +510,39 @@ impl Engine {
                 }
             }
         }
-        let result = self.commit(group.iter().flat_map(|(b, _)| b.ops()));
+        let all = || group.iter().flat_map(Batch::ops);
+        let result = self.write_ops(all());
         self.groups += 1;
         self.grouped_writes += group.len() as u64;
+        if result.is_ok() {
+            // Before the publish: a caller that has its reply sees the
+            // cache counts after its write. A write only updates keys that
+            // are in the cache, so this costs one hash lookup per op.
+            self.cache_writes(all(), self.now);
+        }
         let result: Result<(), HortonError> = result.map_err(Into::into);
         self.publish();
-        for (_, reply) in group {
+        for reply in replies {
             let _ = reply.send(result.clone());
         }
     }
 
+    /// Writes `ops` and the store clock as one atomic batch, then updates
+    /// the read cache.
+    fn commit<'a>(
+        &mut self,
+        ops: impl Iterator<Item = &'a BatchOp> + Clone,
+    ) -> Result<(), DbError> {
+        self.write_ops(ops.clone())?;
+        self.cache_writes(ops, self.now);
+        Ok(())
+    }
+
     /// Writes `ops` and the store clock as one atomic batch. The caller
-    /// keeps the ops within [`MAX_BATCH_BYTES`] and `GROUP_OPS - 1`.
-    fn commit<'a>(&mut self, ops: impl Iterator<Item = &'a BatchOp>) -> Result<(), DbError> {
+    /// keeps the ops within [`MAX_BATCH_BYTES`] and `GROUP_OPS - 1`, and
+    /// then gives the same ops to [`cache_writes`](Self::cache_writes).
+    /// A failure clears the read cache.
+    fn write_ops<'a>(&mut self, ops: impl Iterator<Item = &'a BatchOp>) -> Result<(), DbError> {
         let now = self.now;
         self.batch.clear();
         for op in ops {
@@ -442,13 +572,36 @@ impl Engine {
         }
         let purge = self.purge();
         let batch = &*self.batch;
-        self.room.with_room(&mut self.db, purge, |db| {
+        let written = self.room.with_room(&mut self.db, purge, |db| {
             block_on(db.write(batch)).map(drop)
-        })?;
+        });
+        if let Err(e) = written {
+            // horton may hold the batch or not: forget everything.
+            self.cache.clear();
+            return Err(e);
+        }
         if clock_moves {
             self.durable_clock = now;
+            self.cache.forget(keys::CLOCK_KEY);
         }
         Ok(())
+    }
+
+    /// Applies committed `ops` to the read cache. The expiry ticks are the
+    /// ones [`write_ops`](Self::write_ops) gave horton at clock `now`.
+    fn cache_writes<'a>(&mut self, ops: impl Iterator<Item = &'a BatchOp>, now: u64) {
+        for op in ops {
+            match op {
+                BatchOp::Put(k, v) => self.cache.put(k, v, 0),
+                BatchOp::PutTtl(k, v, secs) => self.cache.put(k, v, ttl::deadline(now, *secs)),
+                BatchOp::Delete(k) => self.cache.delete(k),
+                BatchOp::SessionPut { key, id, val, secs } => {
+                    let expire = ttl::deadline(now, *secs);
+                    self.cache.put(key, val, expire);
+                    self.cache.forget(&keys::session_index_key(expire, id));
+                }
+            }
+        }
     }
 
     /// Deletes every session whose index entry expired at or before `now`,
@@ -465,14 +618,21 @@ impl Engine {
                     continue;
                 };
                 let key = keys::session_key_bytes(id);
-                // A later save moved the expiry: the session is live.
-                if self.get(&key)?.is_none() {
+                // A later save moved the expiry: the session is live. This
+                // reads horton, so dead sessions do not fill the cache.
+                if self.read_db(&key)?.is_none() {
                     deletes.push(BatchOp::Delete(key));
                 }
             }
             for chunk in deletes.chunks(SWEEP_PAGE / 4) {
                 self.commit(chunk.iter())?;
                 swept += chunk.len() as u64;
+                // No get wants a dead session: drop its "absent" entry.
+                for op in chunk {
+                    if let BatchOp::Delete(key) = op {
+                        self.cache.forget(key);
+                    }
+                }
             }
             match page.last() {
                 Some((last, _)) if page.len() == SWEEP_PAGE => {
@@ -482,15 +642,16 @@ impl Engine {
                 _ => break,
             }
         }
-        let start = keys::SESSION_INDEX;
-        let purge = self.purge();
-        self.room.with_room(&mut self.db, purge, |db| {
-            block_on(db.delete_range(start, &end)).map(drop)
-        })?;
+        self.delete_range(keys::SESSION_INDEX, &end)?;
         Ok(swept)
     }
 
-    fn scan_fwd(&self, start: &[u8], end: Option<&[u8]>, limit: usize) -> Result<Entries, DbError> {
+    fn scan_fwd(
+        &mut self,
+        start: &[u8],
+        end: Option<&[u8]>,
+        limit: usize,
+    ) -> Result<Entries, DbError> {
         let mut out = Vec::new();
         if limit == 0 || end.is_some_and(|e| e <= start) {
             return Ok(out);
@@ -498,9 +659,9 @@ impl Engine {
         let mut scan = Box::new(ShapeScan::new(&self.db));
         block_on(scan.seek_with_time(start, end, u64::MAX, self.now))?;
         let mut key = [0u8; KEY_MAX];
-        let mut val = vec![0u8; VAL_MAX];
+        let val = &mut *self.val;
         while out.len() < limit {
-            match block_on(scan.next(&mut key, &mut val))? {
+            match block_on(scan.next(&mut key, val))? {
                 Some((kl, vl)) => out.push((key[..kl].to_vec(), val[..vl].to_vec())),
                 None => break,
             }
@@ -510,7 +671,12 @@ impl Engine {
 
     /// Descending over `[start, end)`. horton's reverse scan starts at the
     /// greatest key `<= from`, so this skips `end` and stops below `start`.
-    fn scan_rev(&self, start: &[u8], end: Option<&[u8]>, limit: usize) -> Result<Entries, DbError> {
+    fn scan_rev(
+        &mut self,
+        start: &[u8],
+        end: Option<&[u8]>,
+        limit: usize,
+    ) -> Result<Entries, DbError> {
         let mut out = Vec::new();
         if limit == 0 || end.is_some_and(|e| e <= start) {
             return Ok(out);
@@ -518,9 +684,9 @@ impl Engine {
         let mut scan = Box::new(ShapeRevScan::new(&self.db));
         block_on(scan.seek_prev_with_time(end.unwrap_or(&[]), None, u64::MAX, self.now))?;
         let mut key = [0u8; KEY_MAX];
-        let mut val = vec![0u8; VAL_MAX];
+        let val = &mut *self.val;
         while out.len() < limit {
-            match block_on(scan.prev(&mut key, &mut val))? {
+            match block_on(scan.prev(&mut key, val))? {
                 Some((kl, _)) if Some(&key[..kl]) == end => {}
                 Some((kl, _)) if &key[..kl] < start => break,
                 Some((kl, vl)) => out.push((key[..kl].to_vec(), val[..vl].to_vec())),
@@ -531,29 +697,61 @@ impl Engine {
     }
 
     fn stats(&self) -> Stats {
-        let level_tables = (0..crate::shape::LEVELS)
-            .map(|l| self.db.level_tables(l).map_or(0, <[_]>::len))
-            .collect();
+        let mut stats = Stats {
+            device_blocks: 0,
+            recovered_records: 0,
+            slots: 0,
+            slots_used: 0,
+            slots_free: 0,
+            level_tables: Vec::with_capacity(crate::shape::LEVELS),
+            io: crate::device::IoStats::default(),
+            cache_hits: 0,
+            cache_misses: 0,
+            read_cache_hits: 0,
+            read_cache_misses: 0,
+            read_cache_entries: 0,
+            read_cache_bytes: 0,
+            groups: 0,
+            grouped_writes: 0,
+            flushes: 0,
+            compaction_jobs: 0,
+            compaction_steps: 0,
+            compaction_pending: false,
+            clock: 0,
+        };
+        self.stats_into(&mut stats);
+        stats
+    }
+
+    /// Writes the current stats over `stats`. It reuses the
+    /// `level_tables` allocation.
+    fn stats_into(&self, stats: &mut Stats) {
+        stats.level_tables.clear();
+        stats.level_tables.extend(
+            (0..crate::shape::LEVELS).map(|l| self.db.level_tables(l).map_or(0, <[_]>::len)),
+        );
         let slots = self.db.slot_stats();
         let cache = self.db.cache_stats();
-        Stats {
-            device_blocks: self.db.device().blocks(),
-            recovered_records: self.open.recovered_records,
-            slots: slots.slots,
-            slots_used: slots.used,
-            slots_free: slots.free,
-            level_tables,
-            io: self.db.device().stats(),
-            cache_hits: cache.hits,
-            cache_misses: cache.misses,
-            groups: self.groups,
-            grouped_writes: self.grouped_writes,
-            flushes: self.room.flushes,
-            compaction_jobs: self.room.jobs,
-            compaction_steps: self.room.steps,
-            compaction_pending: self.db.compaction_pending(),
-            clock: self.now,
-        }
+        stats.device_blocks = self.db.device().blocks();
+        stats.recovered_records = self.open.recovered_records;
+        stats.slots = slots.slots;
+        stats.slots_used = slots.used;
+        stats.slots_free = slots.free;
+        stats.io = self.db.device().stats();
+        stats.cache_hits = cache.hits;
+        stats.cache_misses = cache.misses;
+        let read = self.cache.counts();
+        stats.read_cache_hits = read.hits;
+        stats.read_cache_misses = read.misses;
+        stats.read_cache_entries = read.entries;
+        stats.read_cache_bytes = read.bytes;
+        stats.groups = self.groups;
+        stats.grouped_writes = self.grouped_writes;
+        stats.flushes = self.room.flushes;
+        stats.compaction_jobs = self.room.jobs;
+        stats.compaction_steps = self.room.steps;
+        stats.compaction_pending = self.db.compaction_pending();
+        stats.clock = self.now;
     }
 }
 
@@ -565,6 +763,86 @@ struct Room {
     flushes: u64,
     jobs: u64,
     steps: u64,
+}
+
+/// How long the idle store thread polls the channel before it sleeps.
+const SPIN: std::time::Duration = std::time::Duration::from_micros(50);
+
+/// How this process's store threads poll.
+#[derive(Debug, Clone, Copy)]
+struct Spin {
+    /// How long one idle thread polls.
+    time: std::time::Duration,
+    /// How many store threads may poll at the same time. A fleet opens
+    /// many stores; without a limit, polling threads could take every CPU
+    /// from the runtime workers.
+    threads: usize,
+}
+
+/// Store threads that poll now, in this process.
+static POLLING: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// The poll settings for this machine: half the CPUs may poll. With one
+/// CPU, a poll only keeps the sender from running, so no thread polls.
+fn spin_time() -> Spin {
+    match std::thread::available_parallelism() {
+        Ok(n) if n.get() > 1 => Spin {
+            time: SPIN,
+            threads: n.get() / 2,
+        },
+        _ => Spin {
+            time: std::time::Duration::ZERO,
+            threads: 0,
+        },
+    }
+}
+
+/// One of the [`Spin::threads`] poll places of `count`. It frees the
+/// place on drop.
+struct PollSlot(&'static std::sync::atomic::AtomicUsize);
+
+impl PollSlot {
+    /// Takes a place, or `None` when `max` threads poll already.
+    fn take(count: &'static std::sync::atomic::AtomicUsize, max: usize) -> Option<Self> {
+        use std::sync::atomic::Ordering;
+        // A plain compare-exchange loop: `fetch_update` is deprecated on
+        // new compilers, and its new name is not on the MSRV.
+        let mut n = count.load(Ordering::Acquire);
+        while n < max {
+            match count.compare_exchange_weak(n, n + 1, Ordering::AcqRel, Ordering::Acquire) {
+                Ok(_) => return Some(Self(count)),
+                Err(seen) => n = seen,
+            }
+        }
+        None
+    }
+}
+
+impl Drop for PollSlot {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+    }
+}
+
+/// The next request, or `None` when every sender is gone. The thread polls
+/// for `spin.time` first, if a poll place is free. A caller that sends
+/// again soon then finds the thread awake, and neither side pays for a
+/// sleep and a wake-up.
+fn recv(rx: &mut mpsc::Receiver<Request>, spin: Spin) -> Option<Request> {
+    if let Some(_slot) = PollSlot::take(&POLLING, spin.threads) {
+        let start = std::time::Instant::now();
+        loop {
+            match rx.try_recv() {
+                Ok(r) => return Some(r),
+                Err(mpsc::error::TryRecvError::Disconnected) => return None,
+                Err(mpsc::error::TryRecvError::Empty) if start.elapsed() < spin.time => {
+                    std::hint::spin_loop();
+                }
+                Err(mpsc::error::TryRecvError::Empty) => break,
+            }
+        }
+    }
+    rx.blocking_recv()
 }
 
 /// The store clock on disk, or 0 for a new store.
@@ -651,6 +929,7 @@ mod tests {
             device,
             Arc::new(move || read.load(Ordering::SeqCst)),
             Snapshot::default(),
+            1 << 20,
         )
         .expect("engine")
     }
@@ -673,6 +952,51 @@ mod tests {
             .expect("spawn")
             .join()
             .expect("the test thread panicked");
+    }
+
+    #[test]
+    fn recv_polls_then_sleeps_and_ends_when_the_senders_go() {
+        let spin = Spin {
+            time: std::time::Duration::from_micros(50),
+            threads: 1,
+        };
+        let machine = spin_time();
+        assert!(machine.time <= SPIN);
+        assert_eq!(machine.time.is_zero(), machine.threads == 0);
+        let (tx, mut rx) = mpsc::channel(4);
+        // Sent before the call: the first poll finds it.
+        let (reply, _wait) = oneshot::channel();
+        tx.try_send(Request::Stats(reply)).expect("send");
+        assert!(matches!(recv(&mut rx, spin), Some(Request::Stats(_))));
+        // Sent long after the poll time: the thread sleeps, then wakes.
+        let late = tx.clone();
+        let sender = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            let (reply, _wait) = oneshot::channel();
+            late.blocking_send(Request::Flush(reply)).expect("send");
+        });
+        assert!(matches!(recv(&mut rx, spin), Some(Request::Flush(_))));
+        sender.join().expect("sender");
+        drop(tx);
+        assert!(recv(&mut rx, spin).is_none());
+        let off = Spin {
+            time: std::time::Duration::ZERO,
+            threads: 0,
+        };
+        assert!(recv(&mut rx, off).is_none());
+    }
+
+    #[test]
+    fn poll_places_are_limited_and_freed() {
+        static COUNT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let a = PollSlot::take(&COUNT, 2).expect("first place");
+        let b = PollSlot::take(&COUNT, 2).expect("second place");
+        assert!(PollSlot::take(&COUNT, 2).is_none(), "two threads poll");
+        assert!(PollSlot::take(&COUNT, 0).is_none(), "no place at all");
+        drop(a);
+        let c = PollSlot::take(&COUNT, 2).expect("a freed place");
+        drop((b, c));
+        assert_eq!(COUNT.load(std::sync::atomic::Ordering::Acquire), 0);
     }
 
     #[test]

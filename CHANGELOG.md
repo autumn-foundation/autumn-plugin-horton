@@ -5,6 +5,36 @@ The crate follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Performance
+
+- A read cache on the store thread (`cache_mib`, default 16 MiB; 1 MiB for
+  each fleet store; 0 turns it off). A repeat get does not read horton.
+  Gets add keys; writes update the keys that are in the cache. A hot key
+  with no TTL stays in the cache until a write. Verus proves the cache rules; a property test
+  checks every get against a store without the cache. See ADR 0006.
+- The store thread serves a get and up to three queued gets, then
+  publishes the stats once and replies. Fewer runtime wake-ups.
+- The idle store thread polls the channel for 50 µs before it sleeps. At
+  most half the CPUs poll at the same time, over all the stores of the
+  process; with one CPU, no thread polls. One caller in a loop waits
+  about half as long.
+- The stats publish updates the shared copy in place, and only once for
+  each request.
+- A get no longer allocates and zeroes a 4 KiB buffer. A returned value
+  now has the capacity of its length, not 4 KiB.
+- `benches/throughput.rs`: Criterion benchmarks for put, put with sync,
+  get from the memtable, from tables and through the cache, and scans.
+  `docs/performance.md` has the audit and the numbers.
+
+### Added
+
+- `HortonConfig::cache_mib`, `with_cache_mib`, `cache_bytes`,
+  `HortonPlugin::cache_mib`, `AUTUMN_HORTON__CACHE_MIB` and the fleet key
+  `engine.cache_mib`.
+- `Stats::read_cache_{hits,misses,entries,bytes}` and the metrics
+  `horton_read_cache_{hits,misses}_total` and
+  `horton_read_cache_{entries,bytes}`.
+
 ### Changed
 
 - Support `autumn-web` 0.11. The plugin now needs `autumn-web` 0.11 and

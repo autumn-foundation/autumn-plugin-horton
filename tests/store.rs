@@ -417,3 +417,62 @@ fn an_existing_store_below_the_minimum_is_refused() {
     drop(autumn_plugin_horton::device::FileDevice::open(&config.path, 16, false).expect("small"));
     assert!(matches!(Horton::open(&config), Err(HortonError::Config(_))));
 }
+
+/// Gets that wait in the queue behind writes see those writes. The store
+/// thread serves gets in small batches; a write ends a batch.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn queued_gets_see_the_writes_queued_before_them() {
+    let temp = Temp::new();
+    let db = temp.open();
+    for i in 0..300u32 {
+        let key = format!("k{}", i % 7).into_bytes();
+        let val = i.to_be_bytes();
+        // `biased` polls the calls in order, so they enter the queue in
+        // order: get, get, put, get, get, delete, get.
+        let (g0, g1, p, g2, g3, d, g4) = tokio::join!(
+            biased;
+            db.get(&key),
+            db.get(&key),
+            db.put(&key, &val),
+            db.get(&key),
+            db.get(&key),
+            db.delete(&key),
+            db.get(&key),
+        );
+        p.expect("put");
+        d.expect("delete");
+        assert_eq!(g0, Ok(None), "round {i}");
+        assert_eq!(g1, Ok(None), "round {i}");
+        assert_eq!(g2, Ok(Some(val.to_vec())), "round {i}");
+        assert_eq!(g3, Ok(Some(val.to_vec())), "round {i}");
+        assert_eq!(g4, Ok(None), "round {i}");
+    }
+    db.close().await.expect("close");
+}
+
+/// Many concurrent readers each get their own value back.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_gets_each_get_their_own_value() {
+    let t = Temp::new();
+    let db = t.open();
+    for i in 0..64u32 {
+        db.put(format!("k{i}").as_bytes(), &i.to_be_bytes())
+            .await
+            .expect("put");
+    }
+    let mut tasks = Vec::new();
+    for task in 0..32u32 {
+        let db = db.clone();
+        tasks.push(tokio::spawn(async move {
+            for round in 0..200u32 {
+                let i = (task * 7 + round) % 64;
+                let got = db.get(format!("k{i}").as_bytes()).await.expect("get");
+                assert_eq!(got, Some(i.to_be_bytes().to_vec()));
+            }
+        }));
+    }
+    for task in tasks {
+        task.await.expect("task");
+    }
+    db.close().await.expect("close");
+}

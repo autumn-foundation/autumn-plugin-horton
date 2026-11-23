@@ -355,6 +355,7 @@ fn the_config_reads_the_fleet_and_the_engine_keys() {
             [engine]
             size_mib = 100
             sync = false
+            cache_mib = 3
             "#,
         ),
     )
@@ -364,12 +365,15 @@ fn the_config_reads_the_fleet_and_the_engine_keys() {
     assert_eq!(config.resident_bytes, 1024);
     assert_eq!(config.engine.size_mib, 100);
     assert!(!config.engine.sync);
+    assert_eq!(config.engine.cache_mib, 3);
     let engine = config.engine();
     assert_eq!(engine.ship_every, Duration::from_secs(5));
     let defaults =
         HortonFleetConfig::from_table("horton_fleet", table("mode = \"tenant\"\nroot = \"r\""))
             .unwrap();
     assert_eq!(defaults.engine.size_mib, DEFAULT_FLEET_SIZE_MIB);
+    assert_eq!(defaults.engine.cache_mib, DEFAULT_FLEET_CACHE_MIB);
+    const { assert!(DEFAULT_FLEET_CACHE_MIB * 1024 * 1024 < DEFAULT_RESIDENT_BYTES) };
     assert_eq!(defaults.resident_bytes, DEFAULT_RESIDENT_BYTES);
 }
 

@@ -29,8 +29,10 @@ scripts/verify-verus.sh                        # Verus proofs (CI installs Verus
   touches the `Db`.
 - The store thread replies only after the write is in the WAL.
 - No `unwrap`, `expect` or `panic!` outside tests.
-- `src/ttl.rs`, `src/keys.rs` and `src/group.rs` mirror the Verus specs in
-  `verification/`. Change both together.
+- `src/ttl.rs`, `src/keys.rs`, `src/group.rs` and `src/read_cache.rs`
+  mirror the Verus specs in `verification/`. Change both together.
+- Every engine path that changes horton data also updates the read cache
+  (`Engine::cache_writes`, `delete_range`); a failed write clears it.
 - `src/fleet.rs` (feature `fleet`) is the Autumn fleet engine. A fleet
   database is a directory: `store.horton` and the `identity` stamp file
   (ADR 0005). A snapshot runs on the store thread (`Request::Snapshot`).

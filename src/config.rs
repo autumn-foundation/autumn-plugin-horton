@@ -25,6 +25,9 @@ pub const SECTION: &str = "horton";
 
 const MIB: u64 = 1024 * 1024;
 
+/// The default [`HortonConfig::cache_mib`].
+pub const DEFAULT_CACHE_MIB: u64 = 16;
+
 /// The store settings.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -44,6 +47,9 @@ pub struct HortonConfig {
     pub sync: bool,
     /// Keep Autumn sessions in the store.
     pub sessions: bool,
+    /// The read cache, in MiB. The store thread keeps recent answers in
+    /// memory, so a repeat get does not read the file. 0 turns it off.
+    pub cache_mib: u64,
 }
 
 impl Default for HortonConfig {
@@ -54,6 +60,7 @@ impl Default for HortonConfig {
             size_mib: 256,
             sync: true,
             sessions: false,
+            cache_mib: DEFAULT_CACHE_MIB,
         }
     }
 }
@@ -92,6 +99,20 @@ impl HortonConfig {
     pub const fn with_sessions(mut self, sessions: bool) -> Self {
         self.sessions = sessions;
         self
+    }
+
+    /// Sets [`cache_mib`](Self::cache_mib).
+    #[must_use]
+    pub const fn with_cache_mib(mut self, cache_mib: u64) -> Self {
+        self.cache_mib = cache_mib;
+        self
+    }
+
+    /// The read cache budget in bytes. A budget larger than memory can
+    /// address saturates.
+    #[must_use]
+    pub fn cache_bytes(&self) -> usize {
+        usize::try_from(self.cache_mib.saturating_mul(MIB)).unwrap_or(usize::MAX)
     }
 
     /// The smallest `size_mib` that holds a store.
@@ -179,6 +200,9 @@ impl HortonConfig {
         }
         if let Some(v) = env_value(env, "SESSIONS") {
             self.sessions = parse_bool("SESSIONS", &v)?;
+        }
+        if let Some(v) = env_value(env, "CACHE_MIB") {
+            self.cache_mib = v.parse().map_err(|_| bad_env("CACHE_MIB", &v))?;
         }
         Ok(())
     }

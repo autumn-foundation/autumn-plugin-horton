@@ -34,6 +34,7 @@ tracing = "0.1"
 
 [dev-dependencies]
 autumn-web = { version = "0.11.0", default-features = false, features = ["plugin-conformance", "sqlite"] }
+criterion = { version = "0.8.2", default-features = false, features = ["cargo_bench_support"] }
 proptest = "1"
 tempfile = "3"
 tokio = { version = "1", features = ["full", "test-util"] }
@@ -58,3 +59,7 @@ panic = "warn"
 # Debug assertions and overflow checks stay on.
 [profile.dev]
 opt-level = 2
+
+[[bench]]
+name = "throughput"
+harness = false

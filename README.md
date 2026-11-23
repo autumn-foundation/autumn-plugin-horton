@@ -108,17 +108,18 @@ path = "data/store.horton"     # the store file
 size_mib = 256                 # size of a new file; it is sparse
 sync = true                    # fdatasync every commit
 sessions = false               # keep Autumn sessions in the store
+cache_mib = 16                 # read cache in memory; 0 turns it off
 ```
 
 The plugin reads these layers. A later layer wins:
 
 1. The defaults above.
-2. The builder: `HortonPlugin::new().path(..).size_mib(..).sync(..).sessions(..)`.
+2. The builder: `HortonPlugin::new().path(..).size_mib(..).sync(..).sessions(..).cache_mib(..)`.
 3. `[horton]` in `autumn.toml`.
 4. `[profile.<p>.horton]` in `autumn.toml`.
 5. `[horton]` in `autumn-<p>.toml`.
-6. `AUTUMN_HORTON__ENABLED`, `__PATH`, `__SIZE_MIB`, `__SYNC` and
-   `__SESSIONS`. `.env` files count.
+6. `AUTUMN_HORTON__ENABLED`, `__PATH`, `__SIZE_MIB`, `__SYNC`,
+   `__SESSIONS` and `__CACHE_MIB`. `.env` files count.
 
 `HortonPlugin::new().fixed_config(config)` uses `config` and reads no
 file or variable. An unknown key or a bad value stops the app at
@@ -229,8 +230,8 @@ pub async fn run() {
 ```
 
 The plugin reads `[horton_fleet]`. The top keys are the Autumn fleet keys,
-as in `[database.fleet]`. `engine` has the `size_mib` and `sync` keys of
-`[horton]`:
+as in `[database.fleet]`. `engine` has the `size_mib`, `sync` and
+`cache_mib` keys of `[horton]`:
 
 ```toml
 [horton_fleet]
@@ -244,6 +245,7 @@ resident_bytes = 16777216            # the memory that one open store counts
 [horton_fleet.engine]
 size_mib = 128                       # the size of a new store file (sparse on Linux and macOS)
 sync = true
+cache_mib = 1                        # the read cache of each open store; keep it below resident_bytes
 
 [horton_fleet.ownership]
 owner = "host-a"
@@ -267,6 +269,14 @@ owner = "host-a"
 - The engine passes the Autumn fleet conformance kit
   (`autumn_web::plugin_conformance::fleet`).
 
+## Performance
+
+One store thread serves every call. A read cache in front of horton
+(`cache_mib`) answers repeat gets from memory. Writes go in group commits:
+one WAL block and one `fdatasync` for many callers. See
+[`docs/performance.md`](docs/performance.md) for the benchmark, the
+numbers and the costs that are left in horton.
+
 ## Health and metrics
 
 - `/actuator/health` shows `components.horton`. It is `UP` while the
@@ -275,7 +285,9 @@ owner = "host-a"
 - `/actuator/prometheus` shows `horton_up`, `horton_writes_total`,
   `horton_write_groups_total`, `horton_io_{reads,writes,syncs}_total`,
   `horton_flushes_total`, `horton_compaction_{jobs,steps}_total`,
-  `horton_cache_{hits,misses}_total`, `horton_device_blocks`,
+  `horton_cache_{hits,misses}_total` (horton's block cache),
+  `horton_read_cache_{hits,misses}_total`,
+  `horton_read_cache_{entries,bytes}`, `horton_device_blocks`,
   `horton_slots{state}` and `horton_level_tables{level}`.
 
 ## Development

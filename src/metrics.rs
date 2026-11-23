@@ -96,6 +96,28 @@ fn counters(s: &Stats) -> Vec<MetricFamily> {
             "Block reads that missed the cache.",
             s.cache_misses,
         ),
+        counter(
+            "horton_read_cache_hits_total",
+            "Gets that the read cache answered.",
+            s.read_cache_hits,
+        ),
+        counter(
+            "horton_read_cache_misses_total",
+            "Gets that went to the store.",
+            s.read_cache_misses,
+        ),
+        family(
+            "horton_read_cache_entries",
+            "Entries in the read cache.",
+            MetricKind::Gauge,
+            one(f(s.read_cache_entries)),
+        ),
+        family(
+            "horton_read_cache_bytes",
+            "Bytes the read cache holds.",
+            MetricKind::Gauge,
+            one(f(s.read_cache_bytes)),
+        ),
         family(
             "horton_device_blocks",
             "Store file size in 16 KiB blocks.",

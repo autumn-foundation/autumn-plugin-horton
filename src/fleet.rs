@@ -63,6 +63,11 @@ pub const DEFAULT_RESIDENT_BYTES: u64 = 16 * 1024 * 1024;
 /// The default size of a new store file in a fleet, in MiB.
 pub const DEFAULT_FLEET_SIZE_MIB: u64 = 128;
 
+/// The default read cache of one fleet database, in MiB. Each open
+/// database has its own cache, so the fleet default is small. It stays
+/// inside [`DEFAULT_RESIDENT_BYTES`].
+pub const DEFAULT_FLEET_CACHE_MIB: u64 = 1;
+
 /// The store file in a database directory.
 pub const STORE_FILE: &str = "store.horton";
 
@@ -388,13 +393,15 @@ impl axum::extract::FromRequestParts<AppState> for FleetHorton {
 /// [horton_fleet.engine]
 /// size_mib = 128
 /// sync = true
+/// cache_mib = 1
 ///
 /// [horton_fleet.ownership]
 /// owner = "host-a"
 /// ```
 ///
-/// The top keys are the Autumn fleet keys (`[database.fleet]`). `engine` has the `size_mib` and
-/// `sync` keys of `[horton]`. The variables `AUTUMN_HORTON_FLEET__ROOT` and
+/// The top keys are the Autumn fleet keys (`[database.fleet]`). `engine` has the `size_mib`,
+/// `sync` and `cache_mib` keys of `[horton]`. Each open database has its own read cache:
+/// keep `resident_bytes` above `cache_mib`. The variables `AUTUMN_HORTON_FLEET__ROOT` and
 /// `AUTUMN_HORTON_FLEET__OWNERSHIP__OWNER` set `root` and `ownership.owner`.
 #[derive(Debug, Clone)]
 #[non_exhaustive]
@@ -415,12 +422,14 @@ pub struct HortonFleetConfig {
 struct EngineKeys {
     size_mib: Option<u64>,
     sync: Option<bool>,
+    cache_mib: Option<u64>,
 }
 
 /// The default store configuration of a fleet database.
 fn default_engine() -> HortonConfig {
     HortonConfig {
         size_mib: DEFAULT_FLEET_SIZE_MIB,
+        cache_mib: DEFAULT_FLEET_CACHE_MIB,
         ..HortonConfig::default()
     }
 }
@@ -493,6 +502,9 @@ impl HortonFleetConfig {
                 }
                 if let Some(sync) = keys.sync {
                     engine.sync = sync;
+                }
+                if let Some(cache_mib) = keys.cache_mib {
+                    engine.cache_mib = cache_mib;
                 }
             }
             Some(_) => {
