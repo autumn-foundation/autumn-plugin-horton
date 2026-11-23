@@ -25,6 +25,11 @@
 //!   expiry of a value it returns, so a value from a get holds only for the
 //!   current clock value. "Absent" holds until a write, because the store
 //!   clock never goes back and an expired value stays expired.
+//! - When a key misses again after that ([`Lookup::Stale`]), the store
+//!   thread also asks horton for the key at clock [`FAR`]. A value that is
+//!   live at `FAR` is live at each clock value up to `FAR`, so its entry
+//!   holds until a write. A key that a get reads once costs one horton
+//!   read; a key that it reads again costs two, one time.
 //!
 //! `verification/read_cache.rs` proves that these rules keep every entry
 //! equal to horton's answer. [`visible`], [`answer`] and [`fill_until`]
@@ -41,6 +46,11 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::rc::Rc;
+
+/// The clock value of the second read of a hot key: the largest clock
+/// value below `u64::MAX`. An entry that holds "until a write" has
+/// `valid_until == u64::MAX`, so it holds for each clock value up to here.
+pub const FAR: u64 = u64::MAX - 1;
 
 /// Bytes each entry costs beyond its key and value: the map node, the
 /// shared key header and the eviction queue slot.
@@ -78,10 +88,11 @@ pub const fn answer(has_val: bool, expire_at: u64, valid_until: u64, now: u64) -
 }
 
 /// `valid_until` for an entry that a get at clock `now` fills. A value
-/// holds for `now` only; "absent" holds until a write.
+/// holds for `now` only, or until a write when it is `lasting` (also live
+/// at [`FAR`]). "Absent" holds until a write.
 #[must_use]
-pub const fn fill_until(found: bool, now: u64) -> u64 {
-    if found {
+pub const fn fill_until(found: bool, lasting: bool, now: u64) -> u64 {
+    if found && !lasting {
         now.saturating_add(1)
     } else {
         u64::MAX
@@ -93,8 +104,11 @@ pub const fn fill_until(found: bool, now: u64) -> u64 {
 pub enum Lookup {
     /// The cache knows horton's answer: the value, or `None` for absent.
     Hit(Option<Vec<u8>>),
-    /// horton must answer.
+    /// horton must answer. The cache has no entry for the key.
     Miss,
+    /// horton must answer. The key has an entry, but it no longer holds:
+    /// a get read the key in an earlier clock second. The key is hot.
+    Stale,
 }
 
 /// What the cache knows about one key.
@@ -167,7 +181,7 @@ impl ReadCache {
         }
         let found = self.map.get_mut(key).map_or(Lookup::Miss, |e| {
             match answer(e.val.is_some(), e.expire_at, e.valid_until, now) {
-                Answer::Unknown => Lookup::Miss,
+                Answer::Unknown => Lookup::Stale,
                 Answer::Absent => {
                     e.referenced = true;
                     Lookup::Hit(None)
@@ -178,17 +192,18 @@ impl ReadCache {
                 }
             }
         });
-        if found == Lookup::Miss {
-            self.misses += 1;
-        } else {
+        if let Lookup::Hit(_) = found {
             self.hits += 1;
+        } else {
+            self.misses += 1;
         }
         found
     }
 
     /// Stores horton's answer `found` for a get of `key` at clock `now`.
-    pub fn fill(&mut self, key: &[u8], found: Option<&[u8]>, now: u64) {
-        let valid_until = fill_until(found.is_some(), now);
+    /// `lasting` tells that horton also has the value live at [`FAR`].
+    pub fn fill(&mut self, key: &[u8], found: Option<&[u8]>, now: u64, lasting: bool) {
+        let valid_until = fill_until(found.is_some(), lasting, now);
         self.set(key, found, 0, valid_until, true);
     }
 
@@ -338,28 +353,37 @@ mod tests {
         assert_eq!(answer(true, 5, u64::MAX, 4), Answer::Present);
         assert_eq!(answer(true, 5, u64::MAX, 5), Answer::Absent);
         assert_eq!(answer(false, 0, u64::MAX, 7), Answer::Absent);
-        assert_eq!(fill_until(true, 7), 8);
-        assert_eq!(fill_until(true, u64::MAX), u64::MAX);
-        assert_eq!(fill_until(false, 7), u64::MAX);
+        assert_eq!(fill_until(true, false, 7), 8);
+        assert_eq!(fill_until(true, false, u64::MAX), u64::MAX);
+        assert_eq!(fill_until(true, true, 7), u64::MAX);
+        assert_eq!(fill_until(false, false, 7), u64::MAX);
+        assert_eq!(fill_until(false, true, 7), u64::MAX);
     }
 
     #[test]
     fn a_filled_value_holds_for_its_clock_value_only() {
         let mut c = ReadCache::new(1 << 20);
         assert_eq!(c.lookup(b"k", 5), Lookup::Miss);
-        c.fill(b"k", Some(b"v"), 5);
+        c.fill(b"k", Some(b"v"), 5, false);
         assert_eq!(c.lookup(b"k", 5), Lookup::Hit(Some(b"v".to_vec())));
         assert_eq!(
             c.lookup(b"k", 6),
-            Lookup::Miss,
+            Lookup::Stale,
             "unknown at the next second"
         );
-        c.fill(b"gone", None, 5);
+        c.fill(b"k", Some(b"v"), 6, true);
+        assert_eq!(
+            c.lookup(b"k", 1_000),
+            Lookup::Hit(Some(b"v".to_vec())),
+            "a lasting value holds until a write"
+        );
+        c.fill(b"gone", None, 5, false);
         assert_eq!(c.lookup(b"gone", 1_000), Lookup::Hit(None), "absent holds");
         assert_eq!(
             c.counts(),
             CacheCounts {
-                hits: 2,
+                // Hits at 5, 1_000 (lasting) and "gone"; misses at 5 and 6.
+                hits: 3,
                 misses: 2,
                 entries: 2,
                 bytes: (1 + 1 + 4 + 2 * ENTRY_OVERHEAD) as u64,
@@ -371,7 +395,7 @@ mod tests {
     fn writes_update_and_ranges_remove() {
         let mut c = ReadCache::new(1 << 20);
         for k in [b"a", b"b", b"c"] {
-            c.fill(k, None, 0);
+            c.fill(k, None, 0, false);
         }
         c.put(b"a", b"1", 0);
         c.put(b"b", b"2", 10);
@@ -394,7 +418,7 @@ mod tests {
     fn a_zero_budget_turns_the_cache_off() {
         let mut c = ReadCache::new(0);
         c.put(b"a", b"1", 0);
-        c.fill(b"b", None, 0);
+        c.fill(b"b", None, 0, false);
         assert_eq!(c.lookup(b"a", 0), Lookup::Miss);
         assert_eq!(c.counts(), CacheCounts::default());
     }
@@ -402,7 +426,7 @@ mod tests {
     #[test]
     fn an_entry_larger_than_the_budget_is_not_kept() {
         let mut c = ReadCache::new(ENTRY_OVERHEAD + 4);
-        c.fill(b"k", Some(b"ab"), 0);
+        c.fill(b"k", Some(b"ab"), 0, false);
         assert_eq!(c.counts().entries, 1);
         c.put(b"k", b"abcdefgh", 0);
         assert_eq!(c.lookup(b"k", 0), Lookup::Miss, "the old value is gone too");
@@ -414,11 +438,11 @@ mod tests {
         let per = 2 + 8 + ENTRY_OVERHEAD;
         let mut c = ReadCache::new(per * 4);
         for k in [b"k0", b"k1", b"k2", b"k3"] {
-            c.fill(k, Some(&[0; 8]), 0);
+            c.fill(k, Some(&[0; 8]), 0, false);
         }
         // k0 is used, so it gets a second chance; k1 goes first.
         assert_ne!(c.lookup(b"k0", 0), Lookup::Miss);
-        c.fill(b"k4", Some(&[0; 8]), 0);
+        c.fill(b"k4", Some(&[0; 8]), 0, false);
         assert!(c.counts().bytes <= (per * 4) as u64);
         assert_eq!(c.lookup(b"k1", 0), Lookup::Miss);
         assert_ne!(c.lookup(b"k0", 0), Lookup::Miss);
@@ -431,7 +455,7 @@ mod tests {
         c.put(b"new", b"v", 0);
         c.delete(b"gone");
         assert_eq!(c.counts().entries, 0, "writes add no key");
-        c.fill(b"k", None, 0);
+        c.fill(b"k", None, 0, false);
         c.put(b"k", b"v", 0);
         assert_eq!(c.lookup(b"k", 0), Lookup::Hit(Some(b"v".to_vec())));
         c.put(b"other", b"v", 0);
@@ -445,7 +469,7 @@ mod tests {
         let mut c = ReadCache::new(1 << 20);
         for i in 0..10_000u32 {
             let k = (i % 8).to_be_bytes();
-            c.fill(&k, Some(b"v"), 0);
+            c.fill(&k, Some(b"v"), 0, false);
             c.forget(&k);
         }
         assert!(c.queue.len() <= 64 + 2 * c.map.len() + 1);
@@ -464,7 +488,11 @@ mod tests {
 
     fn step() -> impl Strategy<Value = Step> {
         prop_oneof![
-            (0u8..12, any::<u8>(), prop_oneof![Just(0u64), 1u64..40])
+            (
+                0u8..12,
+                any::<u8>(),
+                prop_oneof![Just(0u64), 1u64..40, Just(99u64)]
+            )
                 .prop_map(|(k, v, e)| Step::Put(k, v, e)),
             (0u8..12).prop_map(Step::Delete),
             (0u8..12, 0u8..12).prop_map(|(a, b)| Step::Range(a, b)),
@@ -500,7 +528,12 @@ mod tests {
             for s in steps {
                 match s {
                     Step::Put(k, v, ttl) => {
-                        let expire = if ttl == 0 { 0 } else { now + ttl };
+                        // 99 stands for the largest expiry tick.
+                        let expire = match ttl {
+                            0 => 0,
+                            99 => u64::MAX,
+                            t => now + t,
+                        };
                         store.insert(vec![k], (vec![v; usize::from(k)], expire));
                         cache.put(&[k], &vec![v; usize::from(k)], expire);
                     }
@@ -516,7 +549,13 @@ mod tests {
                         let want = model_get(&store, &[k], now);
                         match cache.lookup(&[k], now) {
                             Lookup::Hit(hit) => prop_assert_eq!(hit, want),
-                            Lookup::Miss => cache.fill(&[k], want.as_deref(), now),
+                            Lookup::Miss => cache.fill(&[k], want.as_deref(), now, false),
+                            // The engine's rule: a hot key also reads at FAR.
+                            Lookup::Stale => {
+                                let lasting = want.is_some()
+                                    && model_get(&store, &[k], FAR).is_some();
+                                cache.fill(&[k], want.as_deref(), now, lasting);
+                            }
                         }
                     }
                     Step::Tick(d) => now += d,

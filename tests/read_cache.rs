@@ -32,16 +32,19 @@ enum Call {
     Compact,
 }
 
+/// A small key space, so gets, writes and clock steps meet on one key.
+const KEYS: u8 = 8;
+
 fn call() -> impl Strategy<Value = Call> {
     prop_oneof![
-        3 => (0u8..16, any::<u8>()).prop_map(|(k, v)| Call::Put(k, v)),
-        2 => (0u8..16, any::<u8>(), 0u64..4).prop_map(|(k, v, t)| Call::PutTtl(k, v, t)),
-        1 => (0u8..16).prop_map(Call::Delete),
-        1 => (0u8..16, 0u8..16).prop_map(|(a, b)| Call::DeleteRange(a, b)),
-        1 => proptest::collection::vec((0u8..16, proptest::option::of(any::<u8>())), 1..6)
+        3 => (0u8..KEYS, any::<u8>()).prop_map(|(k, v)| Call::Put(k, v)),
+        2 => (0u8..KEYS, any::<u8>(), 0u64..4).prop_map(|(k, v, t)| Call::PutTtl(k, v, t)),
+        1 => (0u8..KEYS).prop_map(Call::Delete),
+        1 => (0u8..KEYS, 0u8..KEYS).prop_map(|(a, b)| Call::DeleteRange(a, b)),
+        1 => proptest::collection::vec((0u8..KEYS, proptest::option::of(any::<u8>())), 1..6)
             .prop_map(Call::Batch),
-        6 => (0u8..16).prop_map(Call::Get),
-        2 => (0u64..3).prop_map(Call::Tick),
+        6 => (0u8..KEYS).prop_map(Call::Get),
+        2 => (0u64..5).prop_map(Call::Tick),
         1 => Just(Call::Flush),
         1 => Just(Call::Compact),
     ]
@@ -174,7 +177,7 @@ async fn run(calls: Vec<Call>) {
     }
     // A last pass reads every key.
     let t = now.load(Ordering::SeqCst);
-    for k in 0..16 {
+    for k in 0..KEYS {
         let got = both(&stores, |db| async move { db.get(&key(k)).await })
             .await
             .unwrap();
@@ -193,7 +196,7 @@ async fn run(calls: Vec<Call>) {
 }
 
 proptest! {
-    #![proptest_config(ProptestConfig::with_cases(24))]
+    #![proptest_config(ProptestConfig::with_cases(96))]
 
     #[test]
     fn the_cache_never_changes_a_get(calls in proptest::collection::vec(call(), 1..120)) {
@@ -335,5 +338,69 @@ async fn sessions_hit_the_cache_and_the_sweep_leaves_no_dead_entries() {
     for i in 0..20 {
         assert_eq!(store.load(&format!("s{i}")).await, Ok(None));
     }
+    db.close().await.expect("close");
+}
+
+/// After a reopen, a key that a get reads in two clock seconds lasts until
+/// a write. A key with a TTL does not: it goes back to horton once a
+/// second, and it still expires on time.
+#[tokio::test]
+async fn a_hot_key_lasts_and_a_ttl_key_does_not() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let now = Arc::new(AtomicU64::new(1_000));
+    let clock = || {
+        let read = Arc::clone(&now);
+        let clock: Clock = Arc::new(move || read.load(Ordering::SeqCst));
+        clock
+    };
+    let db = open(&dir, "hot.horton", 1, clock());
+    db.put(b"plain", b"p").await.expect("put");
+    db.put_with_ttl(b"ttl", b"t", Duration::from_secs(10))
+        .await
+        .expect("put");
+    db.close().await.expect("close");
+
+    let db = open(&dir, "hot.horton", 1, clock());
+    let misses = |s: &autumn_plugin_horton::Stats| s.read_cache_misses;
+    for key in [&b"plain"[..], b"ttl"] {
+        assert!(db.get(key).await.expect("get").is_some());
+    }
+    let first = db.stats().await.expect("stats");
+    // The next second: both keys are stale and go back to horton once.
+    now.store(1_001, Ordering::SeqCst);
+    for key in [&b"plain"[..], b"ttl"] {
+        assert!(db.get(key).await.expect("get").is_some());
+    }
+    let second = db.stats().await.expect("stats");
+    assert_eq!(misses(&second) - misses(&first), 2);
+    // Later: "plain" lasts, "ttl" goes back to horton again.
+    now.store(1_005, Ordering::SeqCst);
+    assert_eq!(db.get(b"plain").await, Ok(Some(b"p".to_vec())));
+    let third = db.stats().await.expect("stats");
+    assert_eq!(misses(&third), misses(&second), "the hot key lasts");
+    assert_eq!(db.get(b"ttl").await, Ok(Some(b"t".to_vec())));
+    let fourth = db.stats().await.expect("stats");
+    assert_eq!(misses(&fourth), misses(&third) + 1, "the TTL key does not");
+    // deadline = 1_000 + 10 + 1.
+    now.store(1_011, Ordering::SeqCst);
+    assert_eq!(db.get(b"ttl").await, Ok(None));
+    // A write still updates the lasting entry.
+    db.put(b"plain", b"q").await.expect("put");
+    assert_eq!(db.get(b"plain").await, Ok(Some(b"q".to_vec())));
+    db.delete(b"plain").await.expect("delete");
+    assert_eq!(db.get(b"plain").await, Ok(None));
+    db.close().await.expect("close");
+}
+
+/// A caller that has its reply sees the cache counts after its write.
+#[tokio::test]
+async fn the_snapshot_shows_the_cache_after_a_write() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let db = open(&dir, "snap.horton", 1, Arc::new(|| 1_000));
+    assert_eq!(db.get(b"k").await, Ok(None));
+    let before = db.snapshot().expect("snapshot").read_cache_bytes;
+    db.put(b"k", &[7u8; 300]).await.expect("put");
+    let after = db.snapshot().expect("snapshot").read_cache_bytes;
+    assert_eq!(after, before + 300);
     db.close().await.expect("close");
 }

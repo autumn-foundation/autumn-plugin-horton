@@ -5,3 +5,4 @@
 # It is recommended to check this file in to source control so that
 # everyone who runs the test benefits from these saved cases.
 cc 2b0db81b00ba44880c71b075f48e09f880636673f4908decb1e2c6cde1b58ea5 # shrinks to calls = [Put(7, 167), DeleteRange(4, 14)]
+cc 7e733f1a4b2073cdc363d0c9c1d50fc59b4a3e269076133903f41056fbff5506 # shrinks to calls = [PutTtl(5, 0, 2), Get(5), Tick(1), Get(5), Tick(2), Get(0)]

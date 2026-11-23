@@ -32,6 +32,11 @@ Autumn API. This one is about the plugin's own read path.
   expiry of a value, so a value from a get holds only for the current
   clock second. "Absent" holds until a write: the store clock never goes
   back, so an expired value stays expired.
+- When a key misses again in a later second, the key is hot. The store
+  thread then also reads it at clock `FAR` (`u64::MAX - 1`). A value that
+  is live at `FAR` is live at each clock value up to `FAR`, so its entry
+  holds until a write. A TTL value is not live at `FAR`, so it keeps the
+  one-second rule.
 - The map is a `HashMap` with the standard `SipHash` hasher, because the
   app chooses the keys. Eviction uses the CLOCK rule. A range delete
   walks the whole map; range deletes are rare.
@@ -44,12 +49,13 @@ Autumn API. This one is about the plugin's own read path.
 - A hit costs one hash lookup and one copy. With 128 callers,
   `get_cached` in the benchmark serves about 670,000 gets per second and
   `get_table` (cache off) about 16,500: 40 times more.
-- A key that a get reads but no write touched since open goes back to
-  horton once per clock second. A hot key still hits almost always.
-- Writes do a little more work: one hash lookup per key. The store thread
-  updates the cache after it replies, so the callers do not wait for it.
-  An earlier design that added every written key cost 5 % of put
-  throughput with 128 callers.
+- A hot key with no TTL costs two horton reads, one time; then it hits
+  until a write. A key with a TTL that no write touched since open goes
+  back to horton once per clock second.
+- Writes do a little more work: one hash lookup per key, before the stats
+  publish and the replies. So a caller that has its reply sees the cache
+  counts after its write. An earlier design that added every written key
+  cost 5 % of put throughput with 128 callers.
 - The first get of a key after open goes to horton. A session store reads
   a session before it saves it, so its next load is a hit.
 - Memory use grows by up to `cache_mib`. A fleet counts `resident_bytes`

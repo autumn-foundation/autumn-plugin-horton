@@ -15,8 +15,9 @@ verus! {
 //
 // The proofs show that each step of the store thread keeps `cache_ok`:
 // a put, a delete, a forgotten key (clock and index keys, eviction), a
-// fill from a get, a range delete, a clear, and a clock step. Thus a hit
-// always gives horton's answer.
+// fill from a get, a lasting fill (a hot key that is also live at `FAR`),
+// a range delete, a clear, and a clock step. Thus a hit always gives
+// horton's answer.
 //
 // A write group commits its ops as one horton batch. Its result equals
 // the ops applied one by one, because each op gets a larger sequence
@@ -68,10 +69,16 @@ pub fn answer(has_val: bool, expire_at: u64, valid_until: u64, now: u64) -> (r: 
     }
 }
 
-/// `fill_until`: a value from a get holds for `now` only (saturating);
-/// "absent" holds until a write.
-pub open spec fn spec_fill_until(found: bool, now: u64) -> u64 {
-    if found {
+/// `FAR`: the clock value of the second read of a hot key.
+pub open spec fn far() -> u64 {
+    (u64::MAX - 1) as u64
+}
+
+/// `fill_until`: a value from a get holds for `now` only (saturating), or
+/// until a write when it is `lasting` (also live at `FAR`); "absent" holds
+/// until a write.
+pub open spec fn spec_fill_until(found: bool, lasting: bool, now: u64) -> u64 {
+    if found && !lasting {
         if now == u64::MAX {
             u64::MAX
         } else {
@@ -82,11 +89,11 @@ pub open spec fn spec_fill_until(found: bool, now: u64) -> u64 {
     }
 }
 
-pub fn fill_until(found: bool, now: u64) -> (r: u64)
+pub fn fill_until(found: bool, lasting: bool, now: u64) -> (r: u64)
     ensures
-        r == spec_fill_until(found, now),
+        r == spec_fill_until(found, lasting, now),
 {
-    if found {
+    if found && !lasting {
         if now == u64::MAX {
             u64::MAX
         } else {
@@ -137,10 +144,19 @@ pub open spec fn coherent(e: Entry, s: Option<Stored>, now: u64) -> bool {
         now <= t && says(e, t) is Some ==> says(e, t) == Some(horton_get(s, t))
 }
 
-/// The entry that `ReadCache::fill` stores after a get at `now`.
+/// The entry that `ReadCache::fill` stores after a get at `now`. The
+/// engine passes `lasting` only when horton also has the value live at
+/// `FAR` (`Engine::get`); `lasting_fill_is_coherent` covers that case.
 pub open spec fn fill_entry(s: Option<Stored>, now: u64) -> Entry {
     let found = horton_get(s, now);
-    Entry { val: found, expire_at: 0, valid_until: spec_fill_until(found is Some, now) }
+    Entry { val: found, expire_at: 0, valid_until: spec_fill_until(found is Some, false, now) }
+}
+
+/// The entry of a lasting fill: the value from a get at `now`, which horton
+/// also has live at `FAR`.
+pub open spec fn lasting_entry(s: Option<Stored>, now: u64) -> Entry {
+    let found = horton_get(s, now);
+    Entry { val: found, expire_at: 0, valid_until: spec_fill_until(found is Some, true, now) }
 }
 
 /// The entry that `ReadCache::put` stores for a write.
@@ -167,6 +183,24 @@ pub proof fn fill_is_coherent(s: Option<Stored>, now: u64)
         }
         // "Absent" at `now` stays absent: an expired value stays expired.
 
+    }
+}
+
+/// A value that is live at `now` and at `FAR` is live at each clock value
+/// between: liveness only ends, it never starts again.
+pub proof fn lasting_fill_is_coherent(s: Option<Stored>, now: u64)
+    requires
+        horton_get(s, now) is Some,
+        horton_get(s, far()) is Some,
+    ensures
+        coherent(lasting_entry(s, now), s, now),
+{
+    let e = lasting_entry(s, now);
+    assert forall|t: u64|
+        #![trigger says(e, t)]
+        now <= t && says(e, t) is Some implies says(e, t) == Some(horton_get(s, t)) by {
+        // `says` knows the answer only below u64::MAX, so `t <= far()`.
+        assert(t <= far());
     }
 }
 
@@ -323,6 +357,29 @@ pub proof fn fill_keeps_ok(
         cache_ok(c2, st, now),
 {
     fill_is_coherent(at(st, k), now);
+    one_key_step_keeps_ok(c, st, c2, st, now, k);
+}
+
+/// A get of a hot key `k`: horton has its value live at `now` and at
+/// `FAR`, and the cache keeps it until a write.
+pub proof fn lasting_fill_keeps_ok(
+    c: Map<Seq<u8>, Entry>,
+    st: Map<Seq<u8>, Stored>,
+    c2: Map<Seq<u8>, Entry>,
+    now: u64,
+    k: Seq<u8>,
+)
+    requires
+        cache_ok(c, st, now),
+        horton_get(at(st, k), now) is Some,
+        horton_get(at(st, k), far()) is Some,
+        forall|k2: Seq<u8>|
+            k2 != k && #[trigger] c2.contains_key(k2) ==> c.contains_key(k2) && c2[k2] == c[k2],
+        c2.contains_key(k) ==> c2[k] == lasting_entry(at(st, k), now),
+    ensures
+        cache_ok(c2, st, now),
+{
+    lasting_fill_is_coherent(at(st, k), now);
     one_key_step_keeps_ok(c, st, c2, st, now, k);
 }
 

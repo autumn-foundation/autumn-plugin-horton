@@ -16,8 +16,10 @@
 //!   after it. It serves them, publishes the stats once, then sends the
 //!   replies. A burst of replies wakes fewer runtime threads.
 //! - **Short poll.** An idle thread polls the channel for 50 µs before it
-//!   sleeps (not on a one-CPU machine). A caller that sends again at once
-//!   does not wait for a thread wake-up.
+//!   sleeps. A caller that sends again at once does not wait for a thread
+//!   wake-up. At most half the CPUs poll at the same time, over all the
+//!   stores of the process (a fleet opens many); with one CPU, no thread
+//!   polls.
 //! - **Read cache.** A bounded map of recent answers sits in front of
 //!   horton (`read_cache`). Writes update it after horton accepts them.
 //! - **Clock.** Each request (or read batch) reads the clock once. The store clock is
@@ -41,7 +43,7 @@ use crate::error::{DbError, HortonError};
 use crate::group;
 use crate::handle::{Batch, BatchOp, Clock, Stats};
 use crate::keys;
-use crate::read_cache::{Lookup, ReadCache};
+use crate::read_cache::{FAR, Lookup, ReadCache};
 use crate::shape::{
     BLOCK, KEY_MAX, ShapeCompaction, ShapeDb, ShapeRevScan, ShapeScan, VAL_MAX, block_on,
 };
@@ -150,8 +152,8 @@ pub struct Engine {
     val: Box<[u8; VAL_MAX]>,
     /// The gets of the current read batch. The allocation stays.
     reads: Vec<GetDone>,
-    /// How long the idle thread polls before it sleeps.
-    spin: std::time::Duration,
+    /// How the idle thread polls before it sleeps.
+    spin: Spin,
     /// Recent answers, in front of horton.
     cache: ReadCache,
 }
@@ -412,12 +414,21 @@ impl Engine {
 
     /// The live value of `key` at the store clock. The read cache answers
     /// when it can; else horton answers and the cache keeps the answer.
+    ///
+    /// A value from horton holds for the current clock second only,
+    /// because horton does not return its expiry. When a key misses again
+    /// after that second (`Lookup::Stale`), the key is hot: the thread
+    /// also reads it at [`FAR`]. A value that is live there has no expiry
+    /// that a clock can reach, so its entry holds until a write.
     fn get(&mut self, key: &[u8]) -> Result<Option<Vec<u8>>, DbError> {
-        if let Lookup::Hit(hit) = self.cache.lookup(key, self.now) {
-            return Ok(hit);
-        }
+        let stale = match self.cache.lookup(key, self.now) {
+            Lookup::Hit(hit) => return Ok(hit),
+            Lookup::Miss => false,
+            Lookup::Stale => true,
+        };
         let found = self.read_db(key)?;
-        self.cache.fill(key, found.as_deref(), self.now);
+        let lasting = stale && found.is_some() && self.live_at(key, FAR)?;
+        self.cache.fill(key, found.as_deref(), self.now, lasting);
         Ok(found)
     }
 
@@ -425,6 +436,11 @@ impl Engine {
     fn read_db(&mut self, key: &[u8]) -> Result<Option<Vec<u8>>, DbError> {
         let buf = &mut *self.val;
         block_on(self.db.get_with_time(key, buf, self.now)).map(|n| n.map(|n| buf[..n].to_vec()))
+    }
+
+    /// True when horton has a value for `key` that is live at clock `t`.
+    fn live_at(&mut self, key: &[u8], t: u64) -> Result<bool, DbError> {
+        block_on(self.db.get_with_time(key, &mut *self.val, t)).map(|n| n.is_some())
     }
 
     /// Deletes `[start, end)` in horton, then in the read cache. A failure
@@ -498,16 +514,16 @@ impl Engine {
         let result = self.write_ops(all());
         self.groups += 1;
         self.grouped_writes += group.len() as u64;
-        let ok = result.is_ok();
+        if result.is_ok() {
+            // Before the publish: a caller that has its reply sees the
+            // cache counts after its write. A write only updates keys that
+            // are in the cache, so this costs one hash lookup per op.
+            self.cache_writes(all(), self.now);
+        }
         let result: Result<(), HortonError> = result.map_err(Into::into);
         self.publish();
         for reply in replies {
             let _ = reply.send(result.clone());
-        }
-        // After the replies, so callers do not wait for it. The thread
-        // reads no request before the cache is up to date.
-        if ok {
-            self.cache_writes(all(), self.now);
         }
     }
 
@@ -752,30 +768,81 @@ struct Room {
 /// How long the idle store thread polls the channel before it sleeps.
 const SPIN: std::time::Duration = std::time::Duration::from_micros(50);
 
-/// The poll time for this machine. With one CPU, a poll only keeps the
-/// sender from running, so the thread sleeps at once.
-fn spin_time() -> std::time::Duration {
+/// How this process's store threads poll.
+#[derive(Debug, Clone, Copy)]
+struct Spin {
+    /// How long one idle thread polls.
+    time: std::time::Duration,
+    /// How many store threads may poll at the same time. A fleet opens
+    /// many stores; without a limit, polling threads could take every CPU
+    /// from the runtime workers.
+    threads: usize,
+}
+
+/// Store threads that poll now, in this process.
+static POLLING: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// The poll settings for this machine: half the CPUs may poll. With one
+/// CPU, a poll only keeps the sender from running, so no thread polls.
+fn spin_time() -> Spin {
     match std::thread::available_parallelism() {
-        Ok(n) if n.get() > 1 => SPIN,
-        _ => std::time::Duration::ZERO,
+        Ok(n) if n.get() > 1 => Spin {
+            time: SPIN,
+            threads: n.get() / 2,
+        },
+        _ => Spin {
+            time: std::time::Duration::ZERO,
+            threads: 0,
+        },
+    }
+}
+
+/// One of the [`Spin::threads`] poll places of `count`. It frees the
+/// place on drop.
+struct PollSlot(&'static std::sync::atomic::AtomicUsize);
+
+impl PollSlot {
+    /// Takes a place, or `None` when `max` threads poll already.
+    fn take(count: &'static std::sync::atomic::AtomicUsize, max: usize) -> Option<Self> {
+        use std::sync::atomic::Ordering;
+        // A plain compare-exchange loop: `fetch_update` is deprecated on
+        // new compilers, and its new name is not on the MSRV.
+        let mut n = count.load(Ordering::Acquire);
+        while n < max {
+            match count.compare_exchange_weak(n, n + 1, Ordering::AcqRel, Ordering::Acquire) {
+                Ok(_) => return Some(Self(count)),
+                Err(seen) => n = seen,
+            }
+        }
+        None
+    }
+}
+
+impl Drop for PollSlot {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
     }
 }
 
 /// The next request, or `None` when every sender is gone. The thread polls
-/// for `spin` first. A caller that sends again soon then finds the thread
-/// awake, and neither side pays for a sleep and a wake-up.
-fn recv(rx: &mut mpsc::Receiver<Request>, spin: std::time::Duration) -> Option<Request> {
-    let start = std::time::Instant::now();
-    loop {
-        match rx.try_recv() {
-            Ok(r) => return Some(r),
-            Err(mpsc::error::TryRecvError::Disconnected) => return None,
-            Err(mpsc::error::TryRecvError::Empty) if start.elapsed() < spin => {
-                std::hint::spin_loop();
+/// for `spin.time` first, if a poll place is free. A caller that sends
+/// again soon then finds the thread awake, and neither side pays for a
+/// sleep and a wake-up.
+fn recv(rx: &mut mpsc::Receiver<Request>, spin: Spin) -> Option<Request> {
+    if let Some(_slot) = PollSlot::take(&POLLING, spin.threads) {
+        let start = std::time::Instant::now();
+        loop {
+            match rx.try_recv() {
+                Ok(r) => return Some(r),
+                Err(mpsc::error::TryRecvError::Disconnected) => return None,
+                Err(mpsc::error::TryRecvError::Empty) if start.elapsed() < spin.time => {
+                    std::hint::spin_loop();
+                }
+                Err(mpsc::error::TryRecvError::Empty) => break,
             }
-            Err(mpsc::error::TryRecvError::Empty) => return rx.blocking_recv(),
         }
     }
+    rx.blocking_recv()
 }
 
 /// The store clock on disk, or 0 for a new store.
@@ -889,8 +956,13 @@ mod tests {
 
     #[test]
     fn recv_polls_then_sleeps_and_ends_when_the_senders_go() {
-        let spin = std::time::Duration::from_micros(50);
-        assert!(spin_time() <= SPIN);
+        let spin = Spin {
+            time: std::time::Duration::from_micros(50),
+            threads: 1,
+        };
+        let machine = spin_time();
+        assert!(machine.time <= SPIN);
+        assert_eq!(machine.time.is_zero(), machine.threads == 0);
         let (tx, mut rx) = mpsc::channel(4);
         // Sent before the call: the first poll finds it.
         let (reply, _wait) = oneshot::channel();
@@ -907,7 +979,24 @@ mod tests {
         sender.join().expect("sender");
         drop(tx);
         assert!(recv(&mut rx, spin).is_none());
-        assert!(recv(&mut rx, std::time::Duration::ZERO).is_none());
+        let off = Spin {
+            time: std::time::Duration::ZERO,
+            threads: 0,
+        };
+        assert!(recv(&mut rx, off).is_none());
+    }
+
+    #[test]
+    fn poll_places_are_limited_and_freed() {
+        static COUNT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let a = PollSlot::take(&COUNT, 2).expect("first place");
+        let b = PollSlot::take(&COUNT, 2).expect("second place");
+        assert!(PollSlot::take(&COUNT, 2).is_none(), "two threads poll");
+        assert!(PollSlot::take(&COUNT, 0).is_none(), "no place at all");
+        drop(a);
+        let c = PollSlot::take(&COUNT, 2).expect("a freed place");
+        drop((b, c));
+        assert_eq!(COUNT.load(std::sync::atomic::Ordering::Acquire), 0);
     }
 
     #[test]

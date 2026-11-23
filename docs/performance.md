@@ -62,10 +62,11 @@ sequenceDiagram
 |---|---|
 | Read cache (ADR 0006) | A repeat get does not read horton, so it skips the CRC checks. |
 | Read batches of 4 | One stats publish and one burst of replies for up to four gets. Batches of 8, 16 and 256 were slower at 16 callers: the callers wait for the whole batch. |
-| Poll 50 µs before sleep | A caller that sends again at once finds the store thread awake. Not on a one-CPU machine. |
+| Poll 50 µs before sleep | A caller that sends again at once finds the store thread awake. At most half the CPUs poll at the same time, over all stores of the process. Not on a one-CPU machine. |
 | Publish once, in place | No allocation and one mutex lock for each request. |
 | Reused value buffer | No 4 KiB `calloc` per get. A returned value has the capacity of its length. |
-| Cache updates after replies | A write group replies first, then updates the cache. The thread reads no request before the update is done. |
+| Writes update only cached keys | A write costs one hash lookup per op in the cache. Keys that the app writes but does not read take no space. The update runs before the stats publish, so the stats match each reply. |
+| Hot keys last | A key that misses in two clock seconds is also read at clock `FAR`. A value live there holds until a write, so a hot key costs two horton reads one time. |
 
 ## Results
 
