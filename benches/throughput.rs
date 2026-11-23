@@ -178,7 +178,7 @@ fn scans(c: &mut Criterion) {
             b.iter_custom(|iters| {
                 drive(&rt, &db, tasks, iters, |db, i| async move {
                     let rows = db.scan(&key(i), None, 100).await.expect("scan");
-                    assert!(!rows.is_empty());
+                    assert_ne!(rows.len(), 0);
                 })
             });
         });
